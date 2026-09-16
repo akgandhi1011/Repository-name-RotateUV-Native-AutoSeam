@@ -1,0 +1,3 @@
+RotateUV Native Auto Seam complete clean repository
+Revision 2
+Protocol RUVSEAM 1

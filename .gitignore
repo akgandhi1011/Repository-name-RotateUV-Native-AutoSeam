@@ -1,0 +1,7 @@
+/build/
+/dist/
+/tools/
+/third_party/
+*.log
+*.obj
+*.seams

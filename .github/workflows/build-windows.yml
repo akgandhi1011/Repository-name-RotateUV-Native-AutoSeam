@@ -1,0 +1,150 @@
+name: Build Windows Auto Seam Worker
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'scripts/**'
+      - '.github/workflows/build-windows.yml'
+      - 'Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.ms'
+      - 'Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.mcr'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - name: Checkout RotateUV repository
+        uses: actions/checkout@v4
+
+      - name: Enable MSVC x64
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Prepare output folder
+        shell: pwsh
+        run: New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+      - name: Try published Windows OptCuts runtime
+        id: prebuilt
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $headers = @{
+            'Accept' = 'application/vnd.github+json'
+            'User-Agent' = 'RotateUV-AutoSeam-GitHub-Actions'
+          }
+          $found = $false
+          try {
+            $releases = Invoke-RestMethod -Headers $headers -Uri 'https://api.github.com/repos/GeraltZeroZhong/TopoPPI/releases?per_page=30'
+            foreach ($release in $releases) {
+              $opt = $release.assets | Where-Object { $_.name -eq 'OptCuts_bin-windows-x86_64.exe' } | Select-Object -First 1
+              if ($null -ne $opt) {
+                Write-Host "Using published OptCuts Windows asset from TopoPPI release $($release.tag_name)"
+                Invoke-WebRequest -Headers $headers -Uri $opt.browser_download_url -OutFile 'dist\OptCuts_bin.exe'
+                $sidecars = $release.assets | Where-Object { $_.name -match '(?i)(optcuts|libigl|tbb).*windows.*\.dll$' }
+                foreach ($asset in $sidecars) {
+                  Write-Host "Downloading sidecar $($asset.name)"
+                  Invoke-WebRequest -Headers $headers -Uri $asset.browser_download_url -OutFile (Join-Path 'dist' $asset.name)
+                }
+                $found = $true
+                break
+              }
+            }
+          } catch {
+            Write-Warning "Published runtime lookup failed; source fallback will be used. $($_.Exception.Message)"
+          }
+          "found=$($found.ToString().ToLowerInvariant())" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          if (-not $found) { Write-Host 'No published Windows OptCuts asset found. Using source-build fallback.' }
+
+      - name: Checkout OptCuts source with submodules
+        if: steps.prebuilt.outputs.found != 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: liminchen/OptCuts
+          ref: master
+          path: third_party/OptCuts
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Download exact portable CMake 3.25.2
+        if: steps.prebuilt.outputs.found != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path tools | Out-Null
+          Invoke-WebRequest -Uri 'https://github.com/Kitware/CMake/releases/download/v3.25.2/cmake-3.25.2-windows-x86_64.zip' -OutFile 'tools\cmake.zip'
+          Expand-Archive -Path 'tools\cmake.zip' -DestinationPath 'tools' -Force
+          $cmake = (Resolve-Path 'tools\cmake-3.25.2-windows-x86_64\bin\cmake.exe').Path
+          "ROTATEUV_CMAKE=$cmake" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          $version = (& $cmake --version | Select-Object -First 1)
+          Write-Host $version
+          if ($version -notmatch '3\.25\.2') { throw "Wrong CMake version: $version" }
+
+      - name: Patch legacy OptCuts CMake declarations
+        if: steps.prebuilt.outputs.found != 'true'
+        shell: pwsh
+        run: python scripts\patch_optcuts_cmake.py third_party\OptCuts
+
+      - name: Configure OptCuts fallback with exact CMake
+        if: steps.prebuilt.outputs.found != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:ROTATEUV_CMAKE -S third_party\OptCuts -B third_party\OptCuts\build -G 'Visual Studio 17 2022' -A x64 -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+
+      - name: Build OptCuts fallback
+        if: steps.prebuilt.outputs.found != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          & $env:ROTATEUV_CMAKE --build third_party\OptCuts\build --config Release --parallel 2
+          $opt = Get-ChildItem -Path 'third_party\OptCuts\build' -Recurse -Filter 'OptCuts_bin.exe' -File | Select-Object -First 1
+          if ($null -eq $opt) { throw 'OptCuts_bin.exe was not produced.' }
+          Copy-Item $opt.FullName 'dist\OptCuts_bin.exe' -Force
+          Get-ChildItem -Path 'third_party\OptCuts\build' -Recurse -Filter '*.dll' -File | ForEach-Object { Copy-Item $_.FullName (Join-Path 'dist' $_.Name) -Force }
+
+      - name: Verify OptCuts runtime
+        shell: pwsh
+        run: |
+          if (-not (Test-Path 'dist\OptCuts_bin.exe')) { throw 'OptCuts_bin.exe missing.' }
+          Get-ChildItem dist | Format-Table Name,Length
+
+      - name: Build RotateUV Auto Seam bridge
+        shell: cmd
+        run: cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD src\autoseam_worker.cpp /Fe:dist\RotateUV_AutoSeam.exe
+
+      - name: Copy MaxScript files into runtime artifact
+        shell: pwsh
+        run: |
+          Copy-Item 'Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.ms' 'dist\' -Force
+          Copy-Item 'Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.mcr' 'dist\' -Force
+          Set-Content -Path 'dist\README_RUNTIME.txt' -Encoding utf8 -Value @(
+            'Rotate UV Native Auto Seam runtime',
+            '',
+            'Keep all files in this folder together.',
+            'Open Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.ms in 3ds Max and Evaluate All.',
+            'The MAXScript launches RotateUV_AutoSeam.exe automatically.'
+          )
+
+      - name: Smoke test bridge executable
+        shell: pwsh
+        run: |
+          & 'dist\RotateUV_AutoSeam.exe'
+          $code = $LASTEXITCODE
+          if ($code -ne 2) { throw "Expected usage exit code 2, got $code" }
+          Write-Host 'RotateUV bridge starts correctly.'
+
+      - name: Upload ready-to-use Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: RotateUV-Native-Auto-Seam-Windows
+          path: dist/**
+          if-no-files-found: error
+          retention-days: 30
