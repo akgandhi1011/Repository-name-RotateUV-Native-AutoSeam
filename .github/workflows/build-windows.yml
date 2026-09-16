@@ -140,6 +140,7 @@ jobs:
           $code = $LASTEXITCODE
           if ($code -ne 2) { throw "Expected usage exit code 2, got $code" }
           Write-Host 'RotateUV bridge starts correctly.'
+          exit 0
 
       - name: Upload ready-to-use Windows package
         uses: actions/upload-artifact@v4
