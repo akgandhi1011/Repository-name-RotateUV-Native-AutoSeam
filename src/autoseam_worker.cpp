@@ -177,6 +177,151 @@ static bool looksLikeClosedLoop(const std::vector<EdgeKey>&es){
     if(es.size()<3)return false;std::unordered_map<int,int>d;for(auto&e:es){d[e.a]++;d[e.b]++;}for(auto&kv:d)if(kv.second!=2)return false;return true;
 }
 
+
+// V2.1 structured standard-geometry assist.
+// This is intentionally a high-confidence pre-pass. If it cannot prove that a component
+// behaves like an axial/extruded solid, the original V2 feature-aware planner is used unchanged.
+struct PlanarLoopCandidate {
+    std::vector<EdgeKey> edges;
+    Vec3 center{};
+    Vec3 normal{};
+    double length=0.0;
+    double patchArea=0.0;
+    double avgBoundaryAngle=0.0;
+    double strongFraction=0.0;
+};
+
+static Vec3 loopCenter(const ObjMesh&m,const std::vector<EdgeKey>&es){
+    std::set<int> vs; for(const auto&e:es){vs.insert(e.a);vs.insert(e.b);} Vec3 c{};
+    for(int v:vs)c=c+m.vertices[v-1]; return vs.empty()?c:c/(double)vs.size();
+}
+
+static double loopLength(const MeshTopo&t,const std::vector<EdgeKey>&es){
+    double L=0.0; for(const auto&e:es){auto it=t.edges.find(e);if(it!=t.edges.end())L+=it->second.length;} return L;
+}
+
+static std::vector<PlanarLoopCandidate> collectPlanarLoopCandidates(
+    const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p)
+{
+    std::vector<PlanarLoopCandidate> out;
+    auto patches=planarPatches(m,t,compFaces,p);
+    for(auto&patch:patches){
+        double area=0.0; Vec3 nsum{}; std::unordered_set<int>pf(patch.begin(),patch.end());
+        for(int f:patch){area+=t.faceArea[f];nsum=nsum+t.faceNormal[f]*t.faceArea[f];}
+        if(area < t.totalArea*p.minRegionAreaFrac) continue;
+        Vec3 pnorm=norm(nsum); if(len2(pnorm)<1e-12) continue;
+
+        std::set<EdgeKey>bd; bool hasOutside=false;
+        for(auto&kv:t.edges){const auto&e=kv.second;int inCount=0;for(int f:e.faces)if(pf.count(f))inCount++;
+            if(inCount==1){bd.insert(e.key);if(e.faces.size()==2)hasOutside=true;}}
+        if(!hasOutside||bd.size()<3) continue;
+
+        auto comps=edgeConnectedComponents(bd);
+        for(auto&ec:comps){
+            if(!looksLikeClosedLoop(ec))continue;
+            double angleSum=0.0;int angleN=0,strongN=0; bool hasOpen=false;
+            for(auto&e:ec){auto it=t.edges.find(e);if(it==t.edges.end())continue;const auto&ei=it->second;
+                if(ei.openBoundary){hasOpen=true;break;}
+                if(ei.faces.size()==2){angleSum+=ei.dihedralDeg;angleN++;if(ei.dihedralDeg>=p.featureAngle)strongN++;}}
+            if(hasOpen||angleN==0)continue;
+            double avgAng=angleSum/angleN; double strongFrac=(double)strongN/angleN;
+            if(avgAng < p.featureAngle*0.70 || strongFrac < 0.65) continue;
+            PlanarLoopCandidate c; c.edges=ec;c.center=loopCenter(m,ec);c.normal=pnorm;c.length=loopLength(t,ec);
+            c.patchArea=area;c.avgBoundaryAngle=avgAng;c.strongFraction=strongFrac;out.push_back(std::move(c));
+        }
+    }
+    return out;
+}
+
+static bool dijkstraAxialSlit(
+    const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&regionVerts,
+    const std::set<EdgeKey>&loopEdges,const std::unordered_set<int>&sources,
+    const std::unordered_set<int>&targets,const Vec3&axis,std::vector<EdgeKey>&path)
+{
+    const double INF=std::numeric_limits<double>::infinity();
+    struct AxPrevRec{int v=0;EdgeKey e;bool has=false;}; std::vector<double>d(m.vertices.size()+1,INF);std::vector<AxPrevRec>pr(m.vertices.size()+1);
+    using Q=std::pair<double,int>;std::priority_queue<Q,std::vector<Q>,std::greater<Q>>pq;
+    for(int s:sources)if(regionVerts.count(s)){d[s]=0.0;pq.push({0.0,s});}
+    Vec3 ax=norm(axis); if(len2(ax)<1e-12)return false; int hit=0;
+    while(!pq.empty()){
+        auto [cd,v]=pq.top();pq.pop();if(cd!=d[v])continue;if(targets.count(v)){hit=v;break;}
+        for(auto&e:t.vertexEdges[v]){
+            int o=(e.a==v?e.b:e.a);if(!regionVerts.count(o))continue;auto it=t.edges.find(e);if(it==t.edges.end())continue;
+            Vec3 ev=norm(m.vertices[o-1]-m.vertices[v-1]);double axial=std::abs(dot(ev,ax));
+            // Strongly prefer one continuous generator along the extrusion axis. Radial/shoulder
+            // crossings are still possible, but wandering around a cap/feature loop is expensive.
+            double dirPenalty=1.0 + 5.0*(1.0-axial)*(1.0-axial);
+            double crease=clampd(it->second.dihedralDeg/90.0,0.0,1.0);
+            double creaseFactor=1.0-0.45*crease;
+            double loopPenalty=loopEdges.count(e)?12.0:1.0;
+            double w=std::max(1e-9,it->second.length*dirPenalty*creaseFactor*loopPenalty);
+            double nd=cd+w;if(nd<d[o]){d[o]=nd;pr[o]={v,e,true};pq.push({nd,o});}
+        }
+    }
+    if(!hit)return false;path.clear();int cur=hit;
+    while(!sources.count(cur)){auto&r=pr[cur];if(!r.has){path.clear();return false;}path.push_back(r.e);cur=r.v;}
+    std::reverse(path.begin(),path.end());return !path.empty();
+}
+
+static bool tryAxialStandardAssist(
+    const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p,std::set<EdgeKey>&cuts)
+{
+    std::unordered_set<int>cf(comp.begin(),comp.end());
+    auto loops=collectPlanarLoopCandidates(m,t,cf,p); if(loops.size()<2)return false;
+
+    // Find the strongest family of parallel planar structural loops. Cylinders, boxes,
+    // chamfered boxes and stepped/extruded parts all produce this pattern.
+    const double cosParallel=std::cos(18.0/57.2957795130823208768);
+    int bestSeed=-1;std::vector<int>bestFamily;double bestScore=-1.0;
+    for(int i=0;i<(int)loops.size();++i){
+        std::vector<int>fam;double score=0.0;
+        for(int j=0;j<(int)loops.size();++j){
+            if(std::abs(dot(norm(loops[i].normal),norm(loops[j].normal)))>=cosParallel){fam.push_back(j);score+=loops[j].length;}
+        }
+        if(fam.size()>=2 && (fam.size()>bestFamily.size() || (fam.size()==bestFamily.size()&&score>bestScore))){bestSeed=i;bestFamily=fam;bestScore=score;}
+    }
+    if(bestSeed<0||bestFamily.size()<2)return false;
+
+    Vec3 axis=norm(loops[bestSeed].normal);Vec3 meanC{};
+    for(int idx:bestFamily){if(dot(loops[idx].normal,axis)<0){} meanC=meanC+loops[idx].center;}
+    meanC=meanC/(double)bestFamily.size();
+
+    // Reject unrelated parallel loops scattered around an arbitrary model. Their centers must
+    // approximately share one extrusion axis and span a meaningful distance.
+    double minS=std::numeric_limits<double>::infinity(),maxS=-minS,maxPerp=0.0,meanRadius=0.0;
+    int minIdx=-1,maxIdx=-1;
+    for(int idx:bestFamily){
+        Vec3 dc=loops[idx].center-meanC;double s=dot(dc,axis);Vec3 perp=dc-axis*s;maxPerp=std::max(maxPerp,len(perp));
+        if(s<minS){minS=s;minIdx=idx;}if(s>maxS){maxS=s;maxIdx=idx;}
+        meanRadius+=loops[idx].length/(2.0*3.14159265358979323846);
+    }
+    meanRadius/=bestFamily.size();double span=maxS-minS;
+    if(span < t.avgEdge*0.60)return false;
+    if(maxPerp > std::max(t.avgEdge*1.75,meanRadius*0.30))return false;
+
+    // Avoid grabbing several almost-coincident bevel loops that describe the same station.
+    // Keep the strongest/longest loop per small axial band, but preserve distinct concentric
+    // loops at the same station (e.g. an annular shoulder) because they are real separators.
+    std::vector<int>kept=bestFamily;
+    std::sort(kept.begin(),kept.end(),[&](int a,int b){return dot(loops[a].center,axis)<dot(loops[b].center,axis);});
+
+    std::set<EdgeKey>structuredLoops;
+    for(int idx:kept)for(auto&e:loops[idx].edges)structuredLoops.insert(e);
+    if(structuredLoops.size()<3)return false;
+
+    // Create exactly one global longitudinal slit through all stations instead of one slit per
+    // region. This is the key difference from V2 and prevents the multiple unwanted vertical seams.
+    std::unordered_set<int>src,dst,rv;
+    for(int f:comp){auto&fc=m.faces[f];for(auto&c:fc.c)rv.insert(c.v);}
+    for(auto&e:loops[maxIdx].edges){src.insert(e.a);src.insert(e.b);}for(auto&e:loops[minIdx].edges){dst.insert(e.a);dst.insert(e.b);}
+    std::vector<EdgeKey>slit;
+    if(!dijkstraAxialSlit(m,t,rv,structuredLoops,src,dst,axis,slit))return false;
+
+    cuts=structuredLoops;
+    for(auto&e:slit){auto it=t.edges.find(e);if(it!=t.edges.end()&&!it->second.openBoundary)cuts.insert(e);}
+    return !cuts.empty();
+}
+
 static std::set<EdgeKey> planarBoundaryLoops(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p){
     std::set<EdgeKey> seams;auto patches=planarPatches(m,t,compFaces,p);
     for(auto&patch:patches){
@@ -266,7 +411,7 @@ static void pruneTinyBranches(const MeshTopo&t,const Profile&p,std::set<EdgeKey>
     }
 }
 
-static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
+static std::set<EdgeKey> planFeatureAwareLegacy(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
     std::unordered_set<int>cf(comp.begin(),comp.end());
     std::set<EdgeKey>cuts=featureCycleCore(m,t,cf,p);
     auto planar=planarBoundaryLoops(m,t,cf,p);cuts.insert(planar.begin(),planar.end());
@@ -276,11 +421,21 @@ static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const
     return cuts;
 }
 
+static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
+    std::set<EdgeKey> structured;
+    if(tryAxialStandardAssist(m,t,comp,p,structured)){
+        // Same boundary rule as V2: true mesh openings are already free and should not be emitted.
+        for(auto it=structured.begin();it!=structured.end();){auto ei=t.edges.find(*it);if(ei!=t.edges.end()&&ei->second.openBoundary)it=structured.erase(it);else ++it;}
+        return structured;
+    }
+    return planFeatureAwareLegacy(m,t,comp,p);
+}
+
 static double parseBound(const std::string&s){try{return std::stod(s);}catch(...){return 5.5;}}
 
 int main(int argc,char**argv){
     if(argc<4){
-        std::cerr<<"RotateUV Native Auto Seam V2 - Feature-Aware\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
+        std::cerr<<"RotateUV Native Auto Seam V2.1 - Feature-Aware + Standard Geometry Assist\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
     }
     fs::path inputPath=fs::absolute(argv[1]);fs::path outputPath=fs::absolute(argv[2]);double bound=parseBound(argv[3]);Profile prof=profileFromBound(bound);
     ObjMesh mesh;std::string err;if(!readTriObj(inputPath,mesh,err)){std::cerr<<err<<"\n";return 4;}MeshTopo topo=buildTopo(mesh);auto comps=faceComponents(mesh);
@@ -294,6 +449,6 @@ int main(int argc,char**argv){
     out<<"SEAMS "<<allCuts.size()<<"\n";
     for(auto&e:allCuts)out<<"SEAM "<<e.a<<" "<<e.b<<"\n";
     out<<"END\n";out.close();
-    std::cout<<"RotateUV Feature-Aware Auto Seam: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
+    std::cout<<"RotateUV Feature-Aware Auto Seam V2.1: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
     return 0;
 }
