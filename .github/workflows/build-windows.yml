@@ -1,17 +1,18 @@
-name: Build RotateUV Feature-Aware Auto Seam V2
+name: Build RotateUV Native Auto Seam + Unfold V1
 
 on:
   workflow_dispatch:
   push:
     paths:
       - 'src/**'
-      - 'Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.ms'
-      - 'Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.mcr'
+      - 'Rotate_UV_PRO_NATIVE_UNFOLD_V1.ms'
+      - 'Rotate_UV_PRO_NATIVE_UNFOLD_V1.mcr'
       - '.github/workflows/build-windows.yml'
 
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -21,29 +22,39 @@ jobs:
         with:
           arch: x64
 
-      - name: Build feature-aware worker
+      - name: Build Auto Seam worker
         shell: cmd
         run: |
           if not exist dist mkdir dist
           cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD src\autoseam_worker.cpp /Fe:dist\RotateUV_AutoSeam.exe
 
-      - name: Smoke test worker
+      - name: Build Native Unfold worker
+        shell: cmd
+        run: |
+          cl /nologo /O2 /DNDEBUG /std:c++17 /EHsc /MD src\unfold_worker.cpp /Fe:dist\RotateUV_Unfold.exe
+
+      - name: Smoke test workers
         shell: pwsh
         run: |
           & 'dist\RotateUV_AutoSeam.exe'
-          $code = $LASTEXITCODE
-          if ($code -ne 2) { throw "Expected usage exit code 2, got $code" }
+          $seamCode = $LASTEXITCODE
+          if ($seamCode -ne 2) { throw "Auto Seam worker usage test failed: $seamCode" }
+
+          & 'dist\RotateUV_Unfold.exe'
+          $unfoldCode = $LASTEXITCODE
+          if ($unfoldCode -ne 2) { throw "Native Unfold worker usage test failed: $unfoldCode" }
+
           exit 0
 
-      - name: Copy MaxScript files
+      - name: Copy MaxScript
         shell: pwsh
         run: |
-          Copy-Item Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.ms dist\ -Force
-          Copy-Item Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.mcr dist\ -Force
+          Copy-Item Rotate_UV_PRO_NATIVE_UNFOLD_V1.ms dist\ -Force
+          Copy-Item Rotate_UV_PRO_NATIVE_UNFOLD_V1.mcr dist\ -Force
 
-      - name: Upload ready-to-use Windows package
+      - name: Upload Windows package
         uses: actions/upload-artifact@v4
         with:
-          name: RotateUV-Feature-Aware-Auto-Seam-V2-Windows
+          name: RotateUV-Native-Unfold-V1-Windows
           path: dist/*
           if-no-files-found: error
