@@ -127,10 +127,10 @@ fn RotateUV_Open =
         groupBox grp_unfold "SEAM / UNFOLD / STRAIGHTEN" pos:[6,278] width:292 height:91
 
         -- Row 1: native seam optimization. Generate never changes the Max mesh/UV topology.
-        button btn_seamAnalyze "" pos:[14,292] width:34 height:29 iconName:@"EditUVW\FlattenByPolygonAngle" iconSize:[22,22] tooltip:"Generate Native Auto Seam - OptCuts jointly optimizes cut length and UV distortion. This only prepares a seam proposal."
+        button btn_seamAnalyze "" pos:[14,292] width:34 height:29 iconName:@"EditUVW\FlattenByPolygonAngle" iconSize:[22,22] tooltip:"Generate Native Auto Seam - Feature-Aware planner detects structural loops, caps, transitions and controlled longitudinal openings. This only prepares a seam proposal."
         button btn_seamPreview "" pos:[54,292] width:34 height:29 iconName:@"EditUVW\EditSeams" iconSize:[22,22] tooltip:"Preview Native Auto Seam - selects the proposed internal seam edges on the current Max mesh. Open mesh borders are not proposed."
         button btn_seamApply "" pos:[94,292] width:34 height:29 iconName:@"EditUVW\ConvertEdgeToSeams" iconSize:[22,22] tooltip:"Apply Native Auto Seam - converts the previewed edge selection to Peel/Pelt seams. Existing seams are preserved."
-        dropdownlist ddl_autoSeamProfile "" pos:[136,295] width:152 height:21 items:#("Minimal Seams","Balanced","Low Distortion") selection:2 tooltip:"OptCuts distortion target. Minimal Seams tolerates more stretch for shorter/fewer cuts; Low Distortion normally creates more seams."
+        dropdownlist ddl_autoSeamProfile "" pos:[136,295] width:152 height:21 items:#("Minimal Seams","Balanced","Low Distortion") selection:2 tooltip:"Feature-Aware seam profile. Minimal Seams uses stronger feature thresholds; Low Distortion accepts more structural cuts."
 
         -- Row 2: solve and finishing tools.
         button btn_unfold "" pos:[18,329] width:34 height:31 iconName:@"EditUVW\QuickPeel" iconSize:[23,23] tooltip:"Unfold - requires an explicit Peel/Pelt seam set. Uses the last Auto Seam face scope, or the live face selection; otherwise all faces."
@@ -2512,7 +2512,7 @@ fn RotateUV_Open =
                                 setStatus "Unfold: define/apply seams first."
                                 messageBox "Unfold needs Peel/Pelt seams first.
 
-Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, then press Unfold." title:"Rotate UV - Unfold"
+Use Auto Seam: Generate -> Preview -> Apply, or define seams manually in Edit UVWs, then press Unfold." title:"Rotate UV - Unfold"
                             )
                         )
 
@@ -4361,10 +4361,10 @@ Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, t
 
 
         ----------------------------------------------------------------------
-        -- NATIVE AUTO SEAM V1 - OptCuts bridge
+        -- NATIVE AUTO SEAM V2 - Feature-Aware native planner
         --
         -- The external worker receives only a temporary triangulated copy.
-        -- It returns geometry-vertex PAIRS for internal edges that OptCuts cut.
+        -- It returns geometry-vertex PAIRS for structural seam edges selected by the native feature-aware planner.
         -- The Max model is never triangulated or modified by Generate/Preview.
         ----------------------------------------------------------------------
         fn nativeAutoSeamFindWorker =
@@ -4605,7 +4605,7 @@ Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, t
                     (
                         messageBox (
                             "RotateUV_AutoSeam.exe was not found.\n\n" +
-                            "Build the supplied Native Auto Seam GitHub project, then extract the ENTIRE Windows artifact beside this .ms/.mcr file. Keep OptCuts_bin.exe and all supplied DLLs beside the bridge EXE."
+                            "Build the supplied Native Auto Seam V2 GitHub project, then place RotateUV_AutoSeam.exe beside this .ms/.mcr file."
                         ) title:"Rotate UV - Native Auto Seam"
                         setStatus "AUTO SEAM: native worker not found."
                     )
@@ -4630,7 +4630,7 @@ Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, t
                             local bound = nativeAutoSeamProfileBound()
                             local exitCode = -1
                             local cmd = "\"" + worker + "\" \"" + inPath + "\" \"" + outPath + "\" " + (bound as string) + " 1 > \"" + logPath + "\" 2>&1"
-                            setStatus ("AUTO SEAM: optimizing cuts | " + nativeAutoSeamProfileName())
+                            setStatus ("AUTO SEAM: planning structural seams | " + nativeAutoSeamProfileName())
                             try(HiddenDOSCommand cmd startpath:(getFilenamePath worker) prompt:"Rotate UV - optimizing native seams..." exitCode:&exitCode)catch(exitCode = -999)
 
                             if exitCode != 0 or not doesFileExist outPath then
@@ -4645,7 +4645,7 @@ Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, t
                                 local parsed = nativeAutoSeamReadResult outPath
                                 if parsed[1] then
                                 (
-                                    local mapped = nativeAutoSeamMapGeomPairs parsed[3]
+                                    local mappedCount = nativeAutoSeamMapGeomPairs parsed[3]
                                     seamAnalysisNode = activeUnwrapNode()
                                     local nFaces = 0
                                     try(nFaces = uv.numberPolygons())catch(nFaces = 0)
@@ -4658,7 +4658,7 @@ Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, t
                                     local warn = ""
                                     if parsed[5] > 0 do warn += " | " + parsed[5] as string + " component fail"
                                     if parsed[6] > 0 do warn += " | " + parsed[6] as string + " unmatched tri"
-                                    setStatus ("AUTO SEAM: " + mapped as string + " Max edges | " + parsed[3].count as string + " cuts | " + nativeAutoSeamProfileName() + warn)
+                                    setStatus ("AUTO SEAM: " + mappedCount as string + " Max edges | " + parsed[3].count as string + " cuts | " + nativeAutoSeamProfileName() + warn)
                                 )
                                 else
                                 (
@@ -5509,15 +5509,15 @@ Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, t
                 "Padding                      UV-space gap between arranged shells\n" +
                 "Rotate presets               +/-45, +/-90 and 180 degrees\n" +
                 "Custom Angle                 CW / CCW rotation\n" +
-                "Generate Auto Seam            Native OptCuts cut/distortion optimization\n" +
+                "Generate Auto Seam            Native feature-aware structural seam planning\n" +
                 "Auto Seam Preview             Select proposed internal seam edges\n" +
                 "Auto Seam Apply               Convert proposal to Peel/Pelt seams\n" +
                 "Unfold icon                   Solve from explicit seams\n" +
                 "Optimize icon                 Gentle Unfold3D Optimize\n" +
                 "Straighten UV icon            Rectangularize selected quad-grid UV patches\n" +
                 "Straighten Shell icon         Rectangularize complete selected quad-grid shells\n\n" +
-                "NATIVE AUTO SEAM V1\n" +
-                "Workflow: Generate -> Preview -> Apply -> Unfold. The native worker uses OptCuts to jointly optimize seam/cut length and parameterization distortion. It returns only internal geometry edges that became cuts; true open mesh boundaries remain free and are not proposed. Generate/Preview never triangulate or alter the Max model: only a temporary mesh snapshot is triangulated for the external optimizer. Minimal Seams tolerates more distortion for shorter/fewer cuts; Low Distortion normally adds more cuts.\n\n" +
+                "NATIVE AUTO SEAM V2 - FEATURE-AWARE\n" +
+                "Workflow: Generate -> Preview -> Apply -> Unfold. The native worker analyzes geometry directly: open boundaries are treated as free, structural/cap transition loops are detected from topology and dihedral flow, and tube/strip regions receive controlled longitudinal openings. It returns only internal geometry-edge pairs; true open mesh boundaries are never proposed as seams. Generate/Preview do not alter the Max model. Minimal Seams uses stronger feature thresholds; Low Distortion accepts more structural cuts.\n\n" +
                 "STRAIGHTEN\n" +
                 "Straighten UV detects clean rectangular quad-grid topology, finds four logical borders, then rebuilds a straight U/V grid using 3D-proportional spacing while preserving UV area and center. Straighten Shell applies the same solver to complete selected shells. Non-grid topology is skipped unchanged.\n\n" +
                 "ROTATION CENTER\n" +
@@ -5538,7 +5538,7 @@ Use Atlas: Analyze -> Preview -> Apply, or define seams manually in Edit UVWs, t
             lbl_credit.foreColor = (dotNetClass "System.Drawing.Color").FromArgb 145 145 145
             lbl_credit.backColor = (dotNetClass "System.Drawing.Color").FromArgb 68 68 68
             lbl_credit.font = dotNetObject "System.Drawing.Font" "Segoe UI" 7.0
-            setStatus "Ready - Native AUTO SEAM available."
+            setStatus "Ready - Native FEATURE-AWARE AUTO SEAM available."
         )
     )
 

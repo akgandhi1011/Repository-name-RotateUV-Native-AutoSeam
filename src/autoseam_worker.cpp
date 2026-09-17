@@ -1,15 +1,12 @@
 #include <algorithm>
 #include <array>
-#include <chrono>
 #include <cmath>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <map>
-#include <optional>
 #include <queue>
 #include <set>
 #include <sstream>
@@ -19,380 +16,284 @@
 #include <utility>
 #include <vector>
 
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#endif
-
 namespace fs = std::filesystem;
 
 struct Vec3 { double x=0, y=0, z=0; };
-struct Face { std::array<int,3> v{{0,0,0}}; };
+static Vec3 operator+(const Vec3&a,const Vec3&b){return {a.x+b.x,a.y+b.y,a.z+b.z};}
+static Vec3 operator-(const Vec3&a,const Vec3&b){return {a.x-b.x,a.y-b.y,a.z-b.z};}
+static Vec3 operator*(const Vec3&a,double s){return {a.x*s,a.y*s,a.z*s};}
+static Vec3 operator/(const Vec3&a,double s){return s!=0?a*(1.0/s):Vec3{};}
+static double dot(const Vec3&a,const Vec3&b){return a.x*b.x+a.y*b.y+a.z*b.z;}
+static Vec3 cross(const Vec3&a,const Vec3&b){return {a.y*b.z-a.z*b.y,a.z*b.x-a.x*b.z,a.x*b.y-a.y*b.x};}
+static double len2(const Vec3&a){return dot(a,a);} static double len(const Vec3&a){return std::sqrt(len2(a));}
+static Vec3 norm(const Vec3&a){double l=len(a);return l>1e-15?a/l:Vec3{};}
+static double clampd(double v,double a,double b){return std::max(a,std::min(b,v));}
+
 struct ObjCorner { int v=0; int vt=0; };
 struct ObjFace { std::array<ObjCorner,3> c{}; };
-struct ObjMesh {
-    std::vector<Vec3> vertices; // 1-based externally, 0-based storage
-    std::vector<std::array<double,2>> tex;
-    std::vector<ObjFace> faces;
-};
+struct ObjMesh { std::vector<Vec3> vertices; std::vector<std::array<double,2>> tex; std::vector<ObjFace> faces; };
 
 struct EdgeKey {
     int a=0,b=0;
-    EdgeKey() = default;
-    EdgeKey(int x,int y) { if(x<y){a=x;b=y;} else {a=y;b=x;} }
-    bool operator==(const EdgeKey& o) const { return a==o.a && b==o.b; }
-    bool operator<(const EdgeKey& o) const { return a<o.a || (a==o.a && b<o.b); }
+    EdgeKey()=default;
+    EdgeKey(int x,int y){ if(x<y){a=x;b=y;} else {a=y;b=x;} }
+    bool operator==(const EdgeKey&o)const{return a==o.a&&b==o.b;}
+    bool operator<(const EdgeKey&o)const{return a<o.a||(a==o.a&&b<o.b);}
 };
-struct EdgeHash { size_t operator()(const EdgeKey& e) const noexcept { return (static_cast<size_t>(e.a)<<32) ^ static_cast<unsigned>(e.b); } };
+struct EdgeHash { size_t operator()(const EdgeKey&e)const noexcept {return (static_cast<size_t>(static_cast<unsigned>(e.a))<<32)^static_cast<unsigned>(e.b);} };
 
-static std::string quote(const fs::path& p) {
-    std::string s = p.string();
-    std::string out = "\"";
-    for(char ch: s) { if(ch=='\"') out += "\\\""; else out += ch; }
-    out += "\"";
-    return out;
+static bool parseIndexToken(const std::string& tok,int&v,int&vt){
+    v=vt=0; if(tok.empty()) return false; auto p1=tok.find('/');
+    try{
+        if(p1==std::string::npos){v=std::stoi(tok);return true;}
+        v=std::stoi(tok.substr(0,p1)); auto p2=tok.find('/',p1+1);
+        std::string t=tok.substr(p1+1,(p2==std::string::npos?tok.size():p2)-(p1+1));
+        if(!t.empty()) vt=std::stoi(t); return true;
+    }catch(...){return false;}
 }
 
-static bool parseIndexToken(const std::string& tok, int& v, int& vt) {
-    v = vt = 0;
-    if(tok.empty()) return false;
-    auto p1 = tok.find('/');
-    try {
-        if(p1 == std::string::npos) { v = std::stoi(tok); return true; }
-        v = std::stoi(tok.substr(0,p1));
-        auto p2 = tok.find('/', p1+1);
-        std::string t = tok.substr(p1+1, (p2==std::string::npos?tok.size():p2) - (p1+1));
-        if(!t.empty()) vt = std::stoi(t);
-        return true;
-    } catch(...) { return false; }
-}
-
-static bool readTriObj(const fs::path& path, ObjMesh& mesh, std::string& err) {
-    std::ifstream in(path);
-    if(!in) { err = "Cannot open OBJ: " + path.string(); return false; }
+static bool readTriObj(const fs::path&path,ObjMesh&mesh,std::string&err){
+    std::ifstream in(path); if(!in){err="Cannot open OBJ: "+path.string();return false;}
     std::string line;
-    while(std::getline(in,line)) {
-        if(line.size() < 2) continue;
-        std::istringstream ss(line);
-        std::string tag; ss >> tag;
-        if(tag=="v") {
-            Vec3 p; if(!(ss>>p.x>>p.y>>p.z)) { err="Malformed vertex in OBJ."; return false; }
-            mesh.vertices.push_back(p);
-        } else if(tag=="vt") {
-            double u=0,v=0; if(!(ss>>u>>v)) { err="Malformed vt in OBJ."; return false; }
-            mesh.tex.push_back({u,v});
-        } else if(tag=="f") {
-            std::vector<ObjCorner> corners;
-            std::string tok;
-            while(ss>>tok) {
-                int vi=0,vti=0;
-                if(!parseIndexToken(tok,vi,vti)) { err="Malformed face token in OBJ."; return false; }
-                if(vi < 0) vi = static_cast<int>(mesh.vertices.size()) + vi + 1;
-                if(vti < 0) vti = static_cast<int>(mesh.tex.size()) + vti + 1;
-                corners.push_back({vi,vti});
-            }
-            if(corners.size()!=3) { err="RotateUV Auto Seam worker requires triangulated OBJ input."; return false; }
-            ObjFace f; for(int i=0;i<3;i++) f.c[i]=corners[i]; mesh.faces.push_back(f);
+    while(std::getline(in,line)){
+        if(line.size()<2) continue; std::istringstream ss(line); std::string tag; ss>>tag;
+        if(tag=="v"){
+            Vec3 p; if(!(ss>>p.x>>p.y>>p.z)){err="Malformed vertex in OBJ.";return false;} mesh.vertices.push_back(p);
+        }else if(tag=="vt"){
+            double u=0,v=0; if(!(ss>>u>>v)){err="Malformed vt in OBJ.";return false;} mesh.tex.push_back({u,v});
+        }else if(tag=="f"){
+            std::vector<ObjCorner> cs; std::string tok;
+            while(ss>>tok){int vi=0,vti=0;if(!parseIndexToken(tok,vi,vti)){err="Malformed face token in OBJ.";return false;}
+                if(vi<0) vi=(int)mesh.vertices.size()+vi+1; if(vti<0) vti=(int)mesh.tex.size()+vti+1; cs.push_back({vi,vti});}
+            if(cs.size()!=3){err="RotateUV Feature-Aware worker requires triangulated OBJ input.";return false;}
+            ObjFace f; for(int i=0;i<3;i++) f.c[i]=cs[i]; mesh.faces.push_back(f);
         }
     }
-    if(mesh.vertices.empty() || mesh.faces.empty()) { err="OBJ has no vertices/faces."; return false; }
-    return true;
+    if(mesh.vertices.empty()||mesh.faces.empty()){err="OBJ has no vertices/faces.";return false;} return true;
 }
 
-static std::vector<std::vector<int>> faceComponents(const ObjMesh& m) {
-    std::unordered_map<EdgeKey,std::vector<int>,EdgeHash> edgeFaces;
-    for(int fi=0; fi<(int)m.faces.size(); ++fi) {
-        const auto& f=m.faces[fi];
-        for(int k=0;k<3;k++) edgeFaces[EdgeKey(f.c[k].v, f.c[(k+1)%3].v)].push_back(fi);
-    }
-    std::vector<std::vector<int>> adj(m.faces.size());
-    for(auto& kv: edgeFaces) {
-        const auto& fs=kv.second;
-        for(size_t i=0;i<fs.size();++i) for(size_t j=i+1;j<fs.size();++j) {
-            adj[fs[i]].push_back(fs[j]); adj[fs[j]].push_back(fs[i]);
-        }
-    }
-    std::vector<char> seen(m.faces.size(),0);
-    std::vector<std::vector<int>> comps;
-    for(int s=0;s<(int)m.faces.size();++s) if(!seen[s]) {
-        std::queue<int> q; q.push(s); seen[s]=1; std::vector<int> c;
-        while(!q.empty()) { int f=q.front();q.pop(); c.push_back(f); for(int n:adj[f]) if(!seen[n]){seen[n]=1;q.push(n);} }
-        comps.push_back(std::move(c));
-    }
-    return comps;
-}
-
-struct ComponentExport {
-    fs::path path;
-    std::vector<int> localToGlobal; // local 1-based index => global original 1-based; [0] unused
+struct EdgeInfo {
+    EdgeKey key;
+    std::vector<int> faces;
+    double length=0.0;
+    double dihedralDeg=0.0;
+    bool openBoundary=false;
+};
+struct MeshTopo {
+    std::vector<Vec3> faceNormal;
+    std::vector<Vec3> faceCenter;
+    std::vector<double> faceArea;
+    std::unordered_map<EdgeKey,EdgeInfo,EdgeHash> edges;
+    std::vector<std::vector<EdgeKey>> vertexEdges;
+    double avgEdge=1.0;
+    double totalArea=0.0;
 };
 
-static bool writeComponentObj(const ObjMesh& input, const std::vector<int>& faceIds, const fs::path& path, ComponentExport& exp, std::string& err) {
-    std::set<int> used;
-    for(int fi:faceIds) for(auto& c:input.faces[fi].c) used.insert(c.v);
-    std::unordered_map<int,int> globalToLocal;
-    exp.localToGlobal.assign(1,0);
-    int idx=1;
-    for(int gv:used) { globalToLocal[gv]=idx++; exp.localToGlobal.push_back(gv); }
-    std::ofstream out(path);
-    if(!out) { err="Cannot create component OBJ."; return false; }
-    out<<std::setprecision(17);
-    for(int gv:used) { const auto&p=input.vertices[gv-1]; out<<"v "<<p.x<<" "<<p.y<<" "<<p.z<<"\n"; }
-    for(int fi:faceIds) {
-        auto& f=input.faces[fi];
-        out<<"f "<<globalToLocal[f.c[0].v]<<" "<<globalToLocal[f.c[1].v]<<" "<<globalToLocal[f.c[2].v]<<"\n";
+static MeshTopo buildTopo(const ObjMesh&m){
+    MeshTopo t; int nf=(int)m.faces.size(); t.faceNormal.resize(nf);t.faceCenter.resize(nf);t.faceArea.resize(nf);
+    double edgeSum=0; int edgeCount=0;
+    for(int fi=0;fi<nf;++fi){
+        const auto&f=m.faces[fi]; Vec3 p0=m.vertices[f.c[0].v-1],p1=m.vertices[f.c[1].v-1],p2=m.vertices[f.c[2].v-1];
+        Vec3 cr=cross(p1-p0,p2-p0); double a=0.5*len(cr); t.faceArea[fi]=a;t.totalArea+=a;t.faceNormal[fi]=norm(cr);t.faceCenter[fi]=(p0+p1+p2)/3.0;
+        for(int k=0;k<3;k++){EdgeKey e(f.c[k].v,f.c[(k+1)%3].v);auto&ei=t.edges[e];ei.key=e;ei.faces.push_back(fi);}
     }
-    exp.path=path;
-    return true;
+    t.vertexEdges.resize(m.vertices.size()+1);
+    for(auto&kv:t.edges){auto&e=kv.second;Vec3 a=m.vertices[e.key.a-1],b=m.vertices[e.key.b-1];e.length=len(b-a);edgeSum+=e.length;edgeCount++;
+        e.openBoundary=(e.faces.size()==1); if(e.faces.size()==2){double c=clampd(dot(t.faceNormal[e.faces[0]],t.faceNormal[e.faces[1]]),-1.0,1.0);e.dihedralDeg=std::acos(c)*57.2957795130823208768;} else e.dihedralDeg=180.0;
+        t.vertexEdges[e.key.a].push_back(e.key);t.vertexEdges[e.key.b].push_back(e.key);
+    }
+    if(edgeCount>0) t.avgEdge=edgeSum/edgeCount; return t;
 }
 
-struct QuantKey { long long x=0,y=0,z=0; bool operator==(const QuantKey&o)const{return x==o.x&&y==o.y&&z==o.z;} };
-struct QuantHash { size_t operator()(const QuantKey&k)const noexcept { size_t h=std::hash<long long>{}(k.x); h^=std::hash<long long>{}(k.y)+0x9e3779b9+(h<<6)+(h>>2); h^=std::hash<long long>{}(k.z)+0x9e3779b9+(h<<6)+(h>>2); return h; } };
-static double sqDist(const Vec3&a,const Vec3&b){double x=a.x-b.x,y=a.y-b.y,z=a.z-b.z;return x*x+y*y+z*z;}
-
-static bool mapOutputVertices(const ObjMesh& input, const ObjMesh& out, std::vector<int>& outToInput, std::string& err) {
-    Vec3 mn=input.vertices[0], mx=input.vertices[0];
-    for(auto&p:input.vertices){mn.x=std::min(mn.x,p.x);mn.y=std::min(mn.y,p.y);mn.z=std::min(mn.z,p.z);mx.x=std::max(mx.x,p.x);mx.y=std::max(mx.y,p.y);mx.z=std::max(mx.z,p.z);}
-    double diag=std::sqrt(sqDist(mn,mx));
-    double tol=std::max(1e-9,diag*1e-7);
-    double inv=1.0/tol;
-    std::unordered_map<QuantKey,std::vector<int>,QuantHash> buckets;
-    for(int i=0;i<(int)input.vertices.size();++i){auto&p=input.vertices[i];QuantKey k{llround(p.x*inv),llround(p.y*inv),llround(p.z*inv)};buckets[k].push_back(i+1);}
-    outToInput.assign(out.vertices.size()+1,0);
-    double maxSq=tol*tol*9.0;
-    for(int oi=1;oi<=(int)out.vertices.size();++oi){
-        auto&p=out.vertices[oi-1]; QuantKey base{llround(p.x*inv),llround(p.y*inv),llround(p.z*inv)};
-        int best=0; double bestD=std::numeric_limits<double>::infinity();
-        for(int dx=-1;dx<=1;dx++)for(int dy=-1;dy<=1;dy++)for(int dz=-1;dz<=1;dz++){
-            QuantKey k{base.x+dx,base.y+dy,base.z+dz}; auto it=buckets.find(k); if(it==buckets.end())continue;
-            for(int ii:it->second){double d=sqDist(p,input.vertices[ii-1]); if(d<bestD){bestD=d;best=ii;}}
-        }
-        if(best==0 || bestD>maxSq){err="Could not map an OptCuts output vertex back to the input mesh.";return false;}
-        outToInput[oi]=best;
-    }
-    return true;
+struct Profile {
+    std::string name="Balanced";
+    double featureAngle=38.0;
+    double planarAngle=6.0;
+    double minFeatureLengthFactor=0.20;
+    double minRegionAreaFrac=0.004;
+    bool addClosedFallback=true;
+};
+static Profile profileFromBound(double bound){
+    Profile p;
+    if(bound>=6.5){p.name="Minimal Seams";p.featureAngle=52.0;p.planarAngle=5.0;p.minRegionAreaFrac=0.008;}
+    else if(bound<=4.6){p.name="Low Distortion";p.featureAngle=26.0;p.planarAngle=8.0;p.minRegionAreaFrac=0.002;}
+    return p;
 }
 
-static std::string triKey(int a,int b,int c){std::array<int,3>x{{a,b,c}};std::sort(x.begin(),x.end());return std::to_string(x[0])+","+std::to_string(x[1])+","+std::to_string(x[2]);}
-
-static bool deriveSeams(const ObjMesh& input, const ObjMesh& out, std::set<EdgeKey>& seams, int& unmatchedFaces, std::string& err) {
-    std::vector<int> outToInput;
-    if(!mapOutputVertices(input,out,outToInput,err)) return false;
-    std::unordered_map<std::string,std::vector<int>> inFaceByKey;
-    for(int fi=0;fi<(int)input.faces.size();++fi){auto&f=input.faces[fi];inFaceByKey[triKey(f.c[0].v,f.c[1].v,f.c[2].v)].push_back(fi);}
-    std::unordered_map<std::string,int> usedCount;
-    struct Corr { std::array<int,3> outV{{0,0,0}}; std::array<int,3> outVT{{0,0,0}}; bool ok=false; };
-    std::vector<Corr> corr(input.faces.size()); unmatchedFaces=0;
-    for(const auto& of:out.faces){
-        int m0=(of.c[0].v>0&&of.c[0].v<(int)outToInput.size())?outToInput[of.c[0].v]:0;
-        int m1=(of.c[1].v>0&&of.c[1].v<(int)outToInput.size())?outToInput[of.c[1].v]:0;
-        int m2=(of.c[2].v>0&&of.c[2].v<(int)outToInput.size())?outToInput[of.c[2].v]:0;
-        if(!m0||!m1||!m2){unmatchedFaces++;continue;}
-        std::string key=triKey(m0,m1,m2); auto it=inFaceByKey.find(key); if(it==inFaceByKey.end()){unmatchedFaces++;continue;}
-        int n=usedCount[key]++; if(n>=(int)it->second.size()){unmatchedFaces++;continue;} int fi=it->second[n];
-        auto& inf=input.faces[fi]; Corr cc; cc.ok=true;
-        for(int k=0;k<3;k++){
-            int gv=inf.c[k].v; bool found=false;
-            for(int j=0;j<3;j++) if(outToInput[of.c[j].v]==gv){cc.outV[k]=of.c[j].v;cc.outVT[k]=of.c[j].vt;found=true;break;}
-            if(!found){cc.ok=false;break;}
-        }
-        corr[fi]=cc;
-    }
-    std::unordered_map<EdgeKey,std::vector<int>,EdgeHash> edgeFaces;
-    for(int fi=0;fi<(int)input.faces.size();++fi){auto&f=input.faces[fi];for(int k=0;k<3;k++)edgeFaces[EdgeKey(f.c[k].v,f.c[(k+1)%3].v)].push_back(fi);}
-    auto endpointData=[&](int fi,int gv)->std::pair<int,int>{
-        auto&f=input.faces[fi]; for(int k=0;k<3;k++)if(f.c[k].v==gv)return{corr[fi].outV[k],corr[fi].outVT[k]}; return{0,0};
-    };
-    for(auto&kv:edgeFaces){
-        if(kv.second.size()!=2) continue; // true/open mesh boundaries are free, not proposed as seams
-        int f0=kv.second[0], f1=kv.second[1]; if(!corr[f0].ok||!corr[f1].ok) continue;
-        auto a0=endpointData(f0,kv.first.a), a1=endpointData(f1,kv.first.a);
-        auto b0=endpointData(f0,kv.first.b), b1=endpointData(f1,kv.first.b);
-        bool splitV=(a0.first!=a1.first)||(b0.first!=b1.first);
-        bool splitVT=(a0.second>0&&a1.second>0&&a0.second!=a1.second)||(b0.second>0&&b1.second>0&&b0.second!=b1.second);
-        if(splitV||splitVT) seams.insert(kv.first);
-    }
-    return true;
+static std::vector<std::vector<int>> faceComponents(const ObjMesh&m){
+    std::unordered_map<EdgeKey,std::vector<int>,EdgeHash> ef;
+    for(int fi=0;fi<(int)m.faces.size();++fi){auto&f=m.faces[fi];for(int k=0;k<3;k++)ef[EdgeKey(f.c[k].v,f.c[(k+1)%3].v)].push_back(fi);}
+    std::vector<std::vector<int>> adj(m.faces.size());
+    for(auto&kv:ef) if(kv.second.size()==2){int a=kv.second[0],b=kv.second[1];adj[a].push_back(b);adj[b].push_back(a);}
+    std::vector<char>seen(m.faces.size(),0);std::vector<std::vector<int>>cs;
+    for(int s=0;s<(int)m.faces.size();++s)if(!seen[s]){std::queue<int>q;q.push(s);seen[s]=1;std::vector<int>c;while(!q.empty()){int f=q.front();q.pop();c.push_back(f);for(int n:adj[f])if(!seen[n]){seen[n]=1;q.push(n);}}cs.push_back(std::move(c));}
+    return cs;
 }
 
-static fs::path findResultObj(const fs::path& root, const std::string& token) {
-    fs::path fallback;
-    if(!fs::exists(root)) return {};
-    for(auto it=fs::recursive_directory_iterator(root); it!=fs::recursive_directory_iterator(); ++it){
-        if(!it->is_regular_file()) continue;
-        if(it->path().filename()=="finalResult_mesh.obj") {
-            if(it->path().parent_path().string().find(token)!=std::string::npos) return it->path();
-            fallback=it->path();
+static std::set<EdgeKey> featureCycleCore(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p){
+    std::set<EdgeKey> cand;
+    for(auto&kv:t.edges){const auto&e=kv.second;if(e.faces.size()!=2)continue;if(!compFaces.count(e.faces[0])||!compFaces.count(e.faces[1]))continue;
+        if(e.length < t.avgEdge*p.minFeatureLengthFactor) continue;
+        if(e.dihedralDeg>=p.featureAngle) cand.insert(e.key);
+    }
+    if(cand.empty()) return {};
+    std::unordered_map<int,int> deg; std::unordered_map<int,std::vector<EdgeKey>> inc;
+    for(auto&e:cand){deg[e.a]++;deg[e.b]++;inc[e.a].push_back(e);inc[e.b].push_back(e);}
+    std::queue<int>q; for(auto&kv:deg) if(kv.second<2) q.push(kv.first); std::set<EdgeKey> alive=cand;
+    while(!q.empty()){
+        int v=q.front();q.pop(); if(deg[v]>=2) continue;
+        auto it=inc.find(v);if(it==inc.end())continue;
+        for(auto&e:it->second) if(alive.erase(e)){
+            int o=(e.a==v?e.b:e.a);deg[v]--;deg[o]--;if(deg[o]==1)q.push(o);
         }
     }
-    return fallback;
+    return alive;
 }
 
-#ifdef _WIN32
-static std::wstring winQuoteArg(const std::wstring& arg) {
-    // Windows command-line quoting compatible with CommandLineToArgvW rules.
-    // Paths used by RotateUV can contain spaces (for example "2026 - 64bit"),
-    // so do not route the OptCuts launch through cmd.exe / std::system().
-    if(arg.empty()) return L"\"\"";
-    bool needsQuotes = false;
-    for(wchar_t ch : arg) {
-        if(ch == L' ' || ch == L'\t' || ch == L'\"') { needsQuotes = true; break; }
+static std::vector<std::vector<int>> planarPatches(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p){
+    std::vector<std::vector<int>> adj(m.faces.size());
+    for(auto&kv:t.edges){auto&e=kv.second;if(e.faces.size()!=2)continue;int a=e.faces[0],b=e.faces[1];if(!compFaces.count(a)||!compFaces.count(b))continue;
+        if(e.dihedralDeg<=p.planarAngle){adj[a].push_back(b);adj[b].push_back(a);}
     }
-    if(!needsQuotes) return arg;
-
-    std::wstring out = L"\"";
-    size_t backslashes = 0;
-    for(wchar_t ch : arg) {
-        if(ch == L'\\') {
-            ++backslashes;
-        } else if(ch == L'\"') {
-            out.append(backslashes * 2 + 1, L'\\');
-            out.push_back(L'\"');
-            backslashes = 0;
-        } else {
-            out.append(backslashes, L'\\');
-            backslashes = 0;
-            out.push_back(ch);
-        }
+    std::unordered_set<int>seen;std::vector<std::vector<int>>out;
+    for(int s:compFaces) if(!seen.count(s)){
+        std::queue<int>q;q.push(s);seen.insert(s);std::vector<int>patch;
+        while(!q.empty()){int f=q.front();q.pop();patch.push_back(f);for(int n:adj[f])if(!seen.count(n)){seen.insert(n);q.push(n);}}
+        out.push_back(std::move(patch));
     }
-    out.append(backslashes * 2, L'\\');
-    out.push_back(L'\"');
     return out;
 }
 
-static int runProcessWindows(const fs::path& exe,
-                             const std::vector<std::wstring>& args,
-                             const fs::path& workingDir,
-                             const fs::path& logPath) {
-    HANDLE logHandle = CreateFileW(
-        logPath.c_str(), GENERIC_WRITE,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
-        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if(logHandle == INVALID_HANDLE_VALUE) {
-        return 9001;
-    }
-
-    std::wstring cmdLine = winQuoteArg(exe.wstring());
-    for(const auto& a : args) {
-        cmdLine.push_back(L' ');
-        cmdLine += winQuoteArg(a);
-    }
-    std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
-    mutableCmd.push_back(L'\0');
-
-    STARTUPINFOW si{};
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    si.hStdOutput = logHandle;
-    si.hStdError = logHandle;
-
-    PROCESS_INFORMATION pi{};
-    std::wstring exeW = exe.wstring();
-    std::wstring workW = workingDir.wstring();
-    BOOL ok = CreateProcessW(
-        exeW.c_str(), mutableCmd.data(),
-        nullptr, nullptr, TRUE,
-        CREATE_NO_WINDOW, nullptr,
-        workW.empty() ? nullptr : workW.c_str(),
-        &si, &pi);
-
-    if(!ok) {
-        DWORD err = GetLastError();
-        CloseHandle(logHandle);
-        return 9100 + static_cast<int>(err);
-    }
-
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD exitCode = 1;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    CloseHandle(logHandle);
-    return static_cast<int>(exitCode);
+static std::vector<std::vector<EdgeKey>> edgeConnectedComponents(const std::set<EdgeKey>&edges){
+    std::unordered_map<int,std::vector<EdgeKey>>inc;for(auto&e:edges){inc[e.a].push_back(e);inc[e.b].push_back(e);}std::set<EdgeKey>left=edges;std::vector<std::vector<EdgeKey>>cs;
+    while(!left.empty()){
+        EdgeKey seed=*left.begin();left.erase(left.begin());std::queue<int>q;q.push(seed.a);q.push(seed.b);std::set<int>seenV{seed.a,seed.b};std::vector<EdgeKey>c{seed};
+        while(!q.empty()){int v=q.front();q.pop();for(auto&e:inc[v])if(left.erase(e)){c.push_back(e);int o=(e.a==v?e.b:e.a);if(seenV.insert(o).second)q.push(o);}}
+        cs.push_back(std::move(c));
+    }return cs;
 }
-#endif
 
-static int runOptCuts(const fs::path& exe, const fs::path& inputObj, const fs::path& runDir, double bound, int initialCut, const std::string& token, fs::path& resultObj, fs::path& logPath) {
-    fs::create_directories(runDir);
-    logPath=runDir/"optcuts.log";
+static bool looksLikeClosedLoop(const std::vector<EdgeKey>&es){
+    if(es.size()<3)return false;std::unordered_map<int,int>d;for(auto&e:es){d[e.a]++;d[e.b]++;}for(auto&kv:d)if(kv.second!=2)return false;return true;
+}
 
-#ifdef _WIN32
-    std::ostringstream boundStream;
-    boundStream << std::setprecision(8) << bound;
-    std::vector<std::wstring> args = {
-        L"100",
-        inputObj.generic_wstring(), // OptCuts parses mesh paths using forward slashes even on Windows
-        L"0.999",
-        L"1",
-        L"0",
-        fs::path(boundStream.str()).wstring(),
-        L"1",
-        fs::path(std::to_string(initialCut)).wstring(),
-        fs::path(token).wstring()
-    };
-    int rc = runProcessWindows(exe, args, runDir, logPath);
-#else
-    fs::path old=fs::current_path(); fs::current_path(runDir);
-    std::ostringstream cmd;
-    cmd<<quote(exe)<<" 100 "<<quote(inputObj)<<" 0.999 1 0 "<<std::setprecision(8)<<bound<<" 1 "<<initialCut<<" "<<token
-       <<" > "<<quote(logPath)<<" 2>&1";
-    int rc=std::system(cmd.str().c_str());
-    fs::current_path(old);
-#endif
+static std::set<EdgeKey> planarBoundaryLoops(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p){
+    std::set<EdgeKey> seams;auto patches=planarPatches(m,t,compFaces,p);
+    for(auto&patch:patches){
+        double area=0;std::unordered_set<int>pf(patch.begin(),patch.end());for(int f:patch)area+=t.faceArea[f];
+        if(area < t.totalArea*p.minRegionAreaFrac) continue;
+        std::set<EdgeKey>bd;bool hasOutside=false;
+        for(auto&kv:t.edges){auto&e=kv.second;int inCount=0;for(int f:e.faces)if(pf.count(f))inCount++;if(inCount==1){bd.insert(e.key);if(e.faces.size()==2)hasOutside=true;}}
+        if(!hasOutside||bd.size()<3) continue;
+        auto comps=edgeConnectedComponents(bd);
+        for(auto&ec:comps){if(!looksLikeClosedLoop(ec))continue;
+            // Require the loop to border a real normal change; excludes arbitrary patch fragmentation.
+            double angleSum=0;int angleN=0, strongN=0;
+            for(auto&e:ec){auto it=t.edges.find(e);if(it!=t.edges.end()&&it->second.faces.size()==2){angleSum+=it->second.dihedralDeg;angleN++;if(it->second.dihedralDeg>=p.featureAngle)strongN++;}}
+            double avgAng=angleN?angleSum/angleN:0; double strongFrac=angleN?(double)strongN/angleN:0.0;
+            // A real cap/structural separator has most of its perimeter on a meaningful normal break.
+            // This rejects individual cylinder side quads, whose top/bottom edges are sharp but vertical borders are smooth.
+            if(avgAng < p.featureAngle*0.70 || strongFrac < 0.65) continue;
+            for(auto&e:ec){auto it=t.edges.find(e);if(it!=t.edges.end()&&!it->second.openBoundary)seams.insert(e);}
+        }
+    }
+    return seams;
+}
 
-    resultObj=findResultObj(runDir/"output",token);
-    return rc;
+static std::vector<std::vector<int>> faceRegionsAfterCuts(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const std::set<EdgeKey>&cuts){
+    std::vector<std::vector<int>>adj(m.faces.size());
+    for(auto&kv:t.edges){auto&e=kv.second;if(e.faces.size()!=2||cuts.count(e.key))continue;int a=e.faces[0],b=e.faces[1];if(compFaces.count(a)&&compFaces.count(b)){adj[a].push_back(b);adj[b].push_back(a);}}
+    std::unordered_set<int>seen;std::vector<std::vector<int>>rs;
+    for(int s:compFaces)if(!seen.count(s)){std::queue<int>q;q.push(s);seen.insert(s);std::vector<int>r;while(!q.empty()){int f=q.front();q.pop();r.push_back(f);for(int n:adj[f])if(!seen.count(n)){seen.insert(n);q.push(n);}}rs.push_back(std::move(r));}return rs;
+}
+
+static std::vector<std::vector<EdgeKey>> regionBoundaryComponents(const MeshTopo&t,const std::unordered_set<int>&rf,const std::set<EdgeKey>&cuts){
+    std::set<EdgeKey>bd;
+    for(auto&kv:t.edges){auto&e=kv.second;int in=0;for(int f:e.faces)if(rf.count(f))in++;
+        if(in==1 && (e.openBoundary || cuts.count(e.key) || e.faces.size()==2)) bd.insert(e.key);
+    }
+    return edgeConnectedComponents(bd);
+}
+
+static Vec3 verticesCentroid(const ObjMesh&m,const std::vector<EdgeKey>&edges){
+    std::set<int>vs;for(auto&e:edges){vs.insert(e.a);vs.insert(e.b);}Vec3 c{};for(int v:vs)c=c+m.vertices[v-1];return vs.empty()?c:c/(double)vs.size();
+}
+
+struct PrevRec { int v=0; EdgeKey e; bool has=false; };
+static bool shortestPathBetweenSets(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&regionVerts,const std::set<EdgeKey>&blocked,const std::unordered_set<int>&sources,const std::unordered_set<int>&targets,const Vec3&axis,std::vector<EdgeKey>&path){
+    const double INF=std::numeric_limits<double>::infinity();std::vector<double>d(m.vertices.size()+1,INF);std::vector<PrevRec>pr(m.vertices.size()+1);
+    using Q=std::pair<double,int>;std::priority_queue<Q,std::vector<Q>,std::greater<Q>>pq;for(int s:sources)if(regionVerts.count(s)){d[s]=0;pq.push({0,s});}
+    int hit=0;Vec3 ax=norm(axis);bool useAxis=len2(ax)>1e-12;
+    while(!pq.empty()){auto [cd,v]=pq.top();pq.pop();if(cd!=d[v])continue;if(targets.count(v)){hit=v;break;}
+        for(auto&e:t.vertexEdges[v]){if(blocked.count(e))continue;int o=(e.a==v?e.b:e.a);if(!regionVerts.count(o))continue;auto it=t.edges.find(e);if(it==t.edges.end())continue;
+            Vec3 ev=norm(m.vertices[o-1]-m.vertices[v-1]);double align=useAxis?std::abs(dot(ev,ax)):0.5;double smoothPenalty=1.0+1.7*(1.0-align);
+            // Prefer corners/creases for a seam when they are available, but not enough to override path length.
+            double creaseBonus=1.0-0.35*clampd(it->second.dihedralDeg/90.0,0.0,1.0);double w=std::max(1e-9,it->second.length*smoothPenalty*creaseBonus);
+            double nd=cd+w;if(nd<d[o]){d[o]=nd;pr[o]={v,e,true};pq.push({nd,o});}
+        }
+    }
+    if(!hit)return false;path.clear();int cur=hit;while(!sources.count(cur)){auto&r=pr[cur];if(!r.has){path.clear();return false;}path.push_back(r.e);cur=r.v;}std::reverse(path.begin(),path.end());return !path.empty();
+}
+
+static void addLongitudinalOpenings(const ObjMesh&m,const MeshTopo&t,const std::unordered_set<int>&compFaces,const Profile&p,std::set<EdgeKey>&cuts){
+    auto regions=faceRegionsAfterCuts(m,t,compFaces,cuts);
+    for(auto&r:regions){
+        double area=0;std::unordered_set<int>rf(r.begin(),r.end());std::unordered_set<int>rv;for(int f:r){area+=t.faceArea[f];auto&fc=m.faces[f];for(auto&c:fc.c)rv.insert(c.v);}if(area<t.totalArea*p.minRegionAreaFrac)continue;
+        auto bcs=regionBoundaryComponents(t,rf,cuts);std::vector<std::vector<EdgeKey>> loops;for(auto&bc:bcs)if(bc.size()>=2)loops.push_back(bc);
+        if(loops.size()>=2){
+            // Connect the two boundary components with the largest centroid separation.
+            int bi=0,bj=1;double best=-1;for(int i=0;i<(int)loops.size();++i)for(int j=i+1;j<(int)loops.size();++j){Vec3 a=verticesCentroid(m,loops[i]),b=verticesCentroid(m,loops[j]);double q=len2(b-a);if(q>best){best=q;bi=i;bj=j;}}
+            std::unordered_set<int>A,B;for(auto&e:loops[bi]){A.insert(e.a);A.insert(e.b);}for(auto&e:loops[bj]){B.insert(e.a);B.insert(e.b);}Vec3 ca=verticesCentroid(m,loops[bi]),cb=verticesCentroid(m,loops[bj]);
+            std::vector<EdgeKey>path;if(shortestPathBetweenSets(m,t,rv,cuts,A,B,cb-ca,path)){for(auto&e:path)if(!t.edges.at(e).openBoundary)cuts.insert(e);}        
+        }else if(loops.empty() && p.addClosedFallback && r.size()>=12){
+            // Closed smooth region fallback: create one long controlled slit rather than random little cuts.
+            // Approximate a geodesic diameter with two Dijkstra-like sweeps on the edge graph.
+            int seed=*rv.begin();
+            auto farthest=[&](int s,std::vector<int>*prevOut)->int{
+                std::vector<double>d(m.vertices.size()+1,std::numeric_limits<double>::infinity());std::vector<int>pr(m.vertices.size()+1,0);using Q=std::pair<double,int>;std::priority_queue<Q,std::vector<Q>,std::greater<Q>>pq;d[s]=0;pq.push({0,s});int far=s;
+                while(!pq.empty()){auto [cd,v]=pq.top();pq.pop();if(cd!=d[v])continue;if(cd>d[far])far=v;for(auto&e:t.vertexEdges[v]){if(cuts.count(e))continue;int o=(e.a==v?e.b:e.a);if(!rv.count(o))continue;double nd=cd+t.edges.at(e).length;if(nd<d[o]){d[o]=nd;pr[o]=v;pq.push({nd,o});}}}
+                if(prevOut)*prevOut=std::move(pr);return far;};
+            int a=farthest(seed,nullptr);std::vector<int>pr;int b=farthest(a,&pr);int cur=b;while(cur!=a&&pr[cur]){EdgeKey e(cur,pr[cur]);if(!t.edges.at(e).openBoundary)cuts.insert(e);cur=pr[cur];}
+        }
+    }
+}
+
+static void pruneTinyBranches(const MeshTopo&t,const Profile&p,std::set<EdgeKey>&cuts){
+    // Remove very short dangling seam twigs, but preserve loops and long connector paths.
+    bool changed=true;double minLen=t.avgEdge*0.60;
+    while(changed){changed=false;std::unordered_map<int,int>d;for(auto&e:cuts){d[e.a]++;d[e.b]++;}std::vector<EdgeKey>rm;
+        for(auto&e:cuts){if((d[e.a]==1||d[e.b]==1)&&t.edges.at(e).length<minLen)rm.push_back(e);}for(auto&e:rm)if(cuts.erase(e))changed=true;
+    }
+}
+
+static std::set<EdgeKey> planFeatureAware(const ObjMesh&m,const MeshTopo&t,const std::vector<int>&comp,const Profile&p){
+    std::unordered_set<int>cf(comp.begin(),comp.end());
+    std::set<EdgeKey>cuts=featureCycleCore(m,t,cf,p);
+    auto planar=planarBoundaryLoops(m,t,cf,p);cuts.insert(planar.begin(),planar.end());
+    addLongitudinalOpenings(m,t,cf,p,cuts);pruneTinyBranches(t,p,cuts);
+    // Never output true mesh boundaries: Max already has them for free.
+    for(auto it=cuts.begin();it!=cuts.end();){auto ei=t.edges.find(*it);if(ei!=t.edges.end()&&ei->second.openBoundary)it=cuts.erase(it);else ++it;}
+    return cuts;
 }
 
 static double parseBound(const std::string&s){try{return std::stod(s);}catch(...){return 5.5;}}
 
 int main(int argc,char**argv){
     if(argc<4){
-        std::cerr<<"RotateUV Native Auto Seam worker\nUsage: RotateUV_AutoSeam.exe input.obj output.seams distortionBound [initialCut]\n";
-        return 2;
+        std::cerr<<"RotateUV Native Auto Seam V2 - Feature-Aware\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
     }
-    fs::path inputPath=fs::absolute(argv[1]); fs::path outputPath=fs::absolute(argv[2]);
-    double bound=parseBound(argv[3]); if(bound<=4.0) bound=4.05; int initialCut=(argc>=5?std::atoi(argv[4]):1); if(initialCut!=0&&initialCut!=1) initialCut=1;
-    fs::path exeDir=fs::absolute(fs::path(argv[0])).parent_path(); fs::path optExe=exeDir/"OptCuts_bin.exe";
-    if(!fs::exists(optExe)){std::cerr<<"OptCuts_bin.exe not found beside worker: "<<optExe<<"\n";return 3;}
-    ObjMesh full; std::string err; if(!readTriObj(inputPath,full,err)){std::cerr<<err<<"\n";return 4;}
-    auto comps=faceComponents(full); std::set<EdgeKey> globalSeams; int failed=0,totalUnmatched=0;
-    auto stamp=std::chrono::high_resolution_clock::now().time_since_epoch().count(); fs::path baseRun=inputPath.parent_path()/("rotateuv_optcuts_"+std::to_string(stamp)); fs::create_directories(baseRun);
-    for(size_t ci=0;ci<comps.size();++ci){
-        fs::path compDir=baseRun/("component_"+std::to_string(ci+1)); fs::create_directories(compDir); ComponentExport ce; std::string e;
-        fs::path compObj=compDir/"input.obj"; if(!writeComponentObj(full,comps[ci],compObj,ce,e)){std::cerr<<"Component export failed: "<<e<<"\n";failed++;continue;}
-        std::string token="ruv_"+std::to_string(stamp)+"_c"+std::to_string(ci+1); fs::path resultObj,log;
-        int rc=runOptCuts(optExe,compObj,compDir,bound,initialCut,token,resultObj,log);
-        if(rc!=0||resultObj.empty()||!fs::exists(resultObj)){
-            std::cerr<<"OptCuts failed on component "<<(ci+1)<<" (exit "<<rc<<"). Log: "<<log<<"\n";
-            // Surface the real OptCuts error in RotateUV's main log so the user
-            // never has to hunt through the nested temp component directory.
-            std::ifstream innerLog(log);
-            if(innerLog) {
-                std::cerr << "----- OptCuts inner log -----\n";
-                std::string innerLine;
-                while(std::getline(innerLog, innerLine)) std::cerr << innerLine << "\n";
-                std::cerr << "----- end OptCuts inner log -----\n";
-            }
-            failed++;continue;
-        }
-        ObjMesh inComp,outComp; if(!readTriObj(compObj,inComp,e)){std::cerr<<e<<"\n";failed++;continue;} if(!readTriObj(resultObj,outComp,e)){std::cerr<<"Result parse failed: "<<e<<"\n";failed++;continue;}
-        std::set<EdgeKey> localSeams; int unmatched=0; if(!deriveSeams(inComp,outComp,localSeams,unmatched,e)){std::cerr<<"Seam extraction failed: "<<e<<"\n";failed++;continue;} totalUnmatched+=unmatched;
-        for(auto&s:localSeams){ if(s.a>0&&s.b>0&&s.a<(int)ce.localToGlobal.size()&&s.b<(int)ce.localToGlobal.size()) globalSeams.insert(EdgeKey(ce.localToGlobal[s.a],ce.localToGlobal[s.b])); }
-    }
-    std::ofstream out(outputPath); if(!out){std::cerr<<"Cannot create seam output file.\n";return 6;}
+    fs::path inputPath=fs::absolute(argv[1]);fs::path outputPath=fs::absolute(argv[2]);double bound=parseBound(argv[3]);Profile prof=profileFromBound(bound);
+    ObjMesh mesh;std::string err;if(!readTriObj(inputPath,mesh,err)){std::cerr<<err<<"\n";return 4;}MeshTopo topo=buildTopo(mesh);auto comps=faceComponents(mesh);
+    std::set<EdgeKey>allCuts;for(auto&c:comps){auto s=planFeatureAware(mesh,topo,c,prof);allCuts.insert(s.begin(),s.end());}
+    std::ofstream out(outputPath);if(!out){std::cerr<<"Cannot create seam output file.\n";return 6;}
     out<<"RUVSEAM 1\n";
     out<<"COMPONENTS "<<comps.size()<<"\n";
-    out<<"FAILED_COMPONENTS "<<failed<<"\n";
-    out<<"UNMATCHED_TRIANGLES "<<totalUnmatched<<"\n";
+    out<<"FAILED_COMPONENTS 0\n";
+    out<<"UNMATCHED_TRIANGLES 0\n";
     out<<"DISTORTION_BOUND "<<std::setprecision(8)<<bound<<"\n";
-    out<<"SEAMS "<<globalSeams.size()<<"\n";
-    for(auto&s:globalSeams) out<<"SEAM "<<s.a<<" "<<s.b<<"\n";
-    out<<"END\n";
-    out.close();
-    std::error_code ec; fs::remove_all(baseRun,ec);
-    if(failed==(int)comps.size()) return 7;
-    std::cout<<"RotateUV Auto Seam: "<<globalSeams.size()<<" seam edges from "<<comps.size()<<" component(s); failed="<<failed<<" unmatched="<<totalUnmatched<<"\n";
+    out<<"SEAMS "<<allCuts.size()<<"\n";
+    for(auto&e:allCuts)out<<"SEAM "<<e.a<<" "<<e.b<<"\n";
+    out<<"END\n";out.close();
+    std::cout<<"RotateUV Feature-Aware Auto Seam: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
     return 0;
 }
