@@ -322,7 +322,7 @@ static int runOptCuts(const fs::path& exe, const fs::path& inputObj, const fs::p
     boundStream << std::setprecision(8) << bound;
     std::vector<std::wstring> args = {
         L"100",
-        inputObj.wstring(),
+        inputObj.generic_wstring(), // OptCuts parses mesh paths using forward slashes even on Windows
         L"0.999",
         L"1",
         L"0",
@@ -365,7 +365,17 @@ int main(int argc,char**argv){
         std::string token="ruv_"+std::to_string(stamp)+"_c"+std::to_string(ci+1); fs::path resultObj,log;
         int rc=runOptCuts(optExe,compObj,compDir,bound,initialCut,token,resultObj,log);
         if(rc!=0||resultObj.empty()||!fs::exists(resultObj)){
-            std::cerr<<"OptCuts failed on component "<<(ci+1)<<" (exit "<<rc<<"). Log: "<<log<<"\n";failed++;continue;
+            std::cerr<<"OptCuts failed on component "<<(ci+1)<<" (exit "<<rc<<"). Log: "<<log<<"\n";
+            // Surface the real OptCuts error in RotateUV's main log so the user
+            // never has to hunt through the nested temp component directory.
+            std::ifstream innerLog(log);
+            if(innerLog) {
+                std::cerr << "----- OptCuts inner log -----\n";
+                std::string innerLine;
+                while(std::getline(innerLog, innerLine)) std::cerr << innerLine << "\n";
+                std::cerr << "----- end OptCuts inner log -----\n";
+            }
+            failed++;continue;
         }
         ObjMesh inComp,outComp; if(!readTriObj(compObj,inComp,e)){std::cerr<<e<<"\n";failed++;continue;} if(!readTriObj(resultObj,outComp,e)){std::cerr<<"Result parse failed: "<<e<<"\n";failed++;continue;}
         std::set<EdgeKey> localSeams; int unmatched=0; if(!deriveSeams(inComp,outComp,localSeams,unmatched,e)){std::cerr<<"Seam extraction failed: "<<e<<"\n";failed++;continue;} totalUnmatched+=unmatched;
