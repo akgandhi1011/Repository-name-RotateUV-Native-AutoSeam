@@ -19,6 +19,11 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace fs = std::filesystem;
 
 struct Vec3 { double x=0, y=0, z=0; };
@@ -223,15 +228,119 @@ static fs::path findResultObj(const fs::path& root, const std::string& token) {
     return fallback;
 }
 
+#ifdef _WIN32
+static std::wstring winQuoteArg(const std::wstring& arg) {
+    // Windows command-line quoting compatible with CommandLineToArgvW rules.
+    // Paths used by RotateUV can contain spaces (for example "2026 - 64bit"),
+    // so do not route the OptCuts launch through cmd.exe / std::system().
+    if(arg.empty()) return L"\"\"";
+    bool needsQuotes = false;
+    for(wchar_t ch : arg) {
+        if(ch == L' ' || ch == L'\t' || ch == L'\"') { needsQuotes = true; break; }
+    }
+    if(!needsQuotes) return arg;
+
+    std::wstring out = L"\"";
+    size_t backslashes = 0;
+    for(wchar_t ch : arg) {
+        if(ch == L'\\') {
+            ++backslashes;
+        } else if(ch == L'\"') {
+            out.append(backslashes * 2 + 1, L'\\');
+            out.push_back(L'\"');
+            backslashes = 0;
+        } else {
+            out.append(backslashes, L'\\');
+            backslashes = 0;
+            out.push_back(ch);
+        }
+    }
+    out.append(backslashes * 2, L'\\');
+    out.push_back(L'\"');
+    return out;
+}
+
+static int runProcessWindows(const fs::path& exe,
+                             const std::vector<std::wstring>& args,
+                             const fs::path& workingDir,
+                             const fs::path& logPath) {
+    HANDLE logHandle = CreateFileW(
+        logPath.c_str(), GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if(logHandle == INVALID_HANDLE_VALUE) {
+        return 9001;
+    }
+
+    std::wstring cmdLine = winQuoteArg(exe.wstring());
+    for(const auto& a : args) {
+        cmdLine.push_back(L' ');
+        cmdLine += winQuoteArg(a);
+    }
+    std::vector<wchar_t> mutableCmd(cmdLine.begin(), cmdLine.end());
+    mutableCmd.push_back(L'\0');
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESTDHANDLES;
+    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+    si.hStdOutput = logHandle;
+    si.hStdError = logHandle;
+
+    PROCESS_INFORMATION pi{};
+    std::wstring exeW = exe.wstring();
+    std::wstring workW = workingDir.wstring();
+    BOOL ok = CreateProcessW(
+        exeW.c_str(), mutableCmd.data(),
+        nullptr, nullptr, TRUE,
+        CREATE_NO_WINDOW, nullptr,
+        workW.empty() ? nullptr : workW.c_str(),
+        &si, &pi);
+
+    if(!ok) {
+        DWORD err = GetLastError();
+        CloseHandle(logHandle);
+        return 9100 + static_cast<int>(err);
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(logHandle);
+    return static_cast<int>(exitCode);
+}
+#endif
+
 static int runOptCuts(const fs::path& exe, const fs::path& inputObj, const fs::path& runDir, double bound, int initialCut, const std::string& token, fs::path& resultObj, fs::path& logPath) {
     fs::create_directories(runDir);
     logPath=runDir/"optcuts.log";
+
+#ifdef _WIN32
+    std::ostringstream boundStream;
+    boundStream << std::setprecision(8) << bound;
+    std::vector<std::wstring> args = {
+        L"100",
+        inputObj.wstring(),
+        L"0.999",
+        L"1",
+        L"0",
+        fs::path(boundStream.str()).wstring(),
+        L"1",
+        fs::path(std::to_string(initialCut)).wstring(),
+        fs::path(token).wstring()
+    };
+    int rc = runProcessWindows(exe, args, runDir, logPath);
+#else
     fs::path old=fs::current_path(); fs::current_path(runDir);
     std::ostringstream cmd;
     cmd<<quote(exe)<<" 100 "<<quote(inputObj)<<" 0.999 1 0 "<<std::setprecision(8)<<bound<<" 1 "<<initialCut<<" "<<token
        <<" > "<<quote(logPath)<<" 2>&1";
     int rc=std::system(cmd.str().c_str());
     fs::current_path(old);
+#endif
+
     resultObj=findResultObj(runDir/"output",token);
     return rc;
 }
