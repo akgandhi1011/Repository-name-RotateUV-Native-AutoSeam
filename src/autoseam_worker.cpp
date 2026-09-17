@@ -435,7 +435,7 @@ static double parseBound(const std::string&s){try{return std::stod(s);}catch(...
 
 int main(int argc,char**argv){
     if(argc<4){
-        std::cerr<<"RotateUV Native Auto Seam V2.1 - Feature-Aware + Standard Geometry Assist\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
+        std::cerr<<"RotateUV Native Auto Seam V2.2 - Feature-Aware + Standard Geometry Assist (V2.1 behavior frozen)\nUsage: RotateUV_AutoSeam.exe input.obj output.seams profileBound [legacyInitialCut]\n";return 2;
     }
     fs::path inputPath=fs::absolute(argv[1]);fs::path outputPath=fs::absolute(argv[2]);double bound=parseBound(argv[3]);Profile prof=profileFromBound(bound);
     ObjMesh mesh;std::string err;if(!readTriObj(inputPath,mesh,err)){std::cerr<<err<<"\n";return 4;}MeshTopo topo=buildTopo(mesh);auto comps=faceComponents(mesh);
@@ -449,6 +449,6 @@ int main(int argc,char**argv){
     out<<"SEAMS "<<allCuts.size()<<"\n";
     for(auto&e:allCuts)out<<"SEAM "<<e.a<<" "<<e.b<<"\n";
     out<<"END\n";out.close();
-    std::cout<<"RotateUV Feature-Aware Auto Seam V2.1: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
+    std::cout<<"RotateUV Feature-Aware Auto Seam V2.2: "<<allCuts.size()<<" seam edges | "<<prof.name<<" | components="<<comps.size()<<"\n";
     return 0;
 }

@@ -1,9 +1,12 @@
 # Third-party notices
 
-## OptCuts
-Upstream: https://github.com/liminchen/OptCuts
-OptCuts is the seam/distortion optimization engine. The upstream repository identifies its license as MIT.
+## libigl
+RotateUV Native Unfold V2 uses libigl v2.6.0 for LSCM parameterization and SLIM optimization.
+libigl is distributed under the Mozilla Public License 2.0 for the core functionality used here.
+Project: https://github.com/libigl/libigl
 
-## TopoPPI optional runtime source
-Repository: https://github.com/GeraltZeroZhong/TopoPPI
-The workflow may use a separately published Windows OptCuts convenience binary from a TopoPPI release when available. If unavailable, the workflow builds OptCuts from upstream source.
+## Eigen
+libigl uses Eigen for dense and sparse linear algebra. This build checks out Eigen 3.4.0.
+Project: https://gitlab.com/libeigen/eigen
+
+No libigl or Eigen DLL is required at runtime for this build; the worker is compiled from source by GitHub Actions.

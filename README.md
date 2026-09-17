@@ -1,30 +1,58 @@
-# RotateUV Native Auto Seam V2 - Feature-Aware
+# RotateUV Native Unfold V2 / Standard Geometry V2.2
 
-This is the replacement for the OptCuts-first worker.
+This package upgrades only the native UV solve stage while preserving the established RotateUV UI and the feature-aware seam workflow.
 
-The worker is now self-contained C++17 and does **not** require OptCuts, CMake, TBB, DLLs, or any third-party runtime.
+## What changed
 
-## Seam planning
+- `RotateUV_AutoSeam.exe`: V2.2 package label; the successful V2.1 feature-aware/standard-geometry behavior is intentionally frozen rather than rewritten.
+- `RotateUV_Unfold.exe`: custom LSCM approximation removed.
+- Native Unfold V2 uses **libigl v2.6.0**:
+  1. exact planar projection for truly planar charts,
+  2. libigl LSCM initialization for cut non-planar charts,
+  3. harmonic circle initialization if LSCM starts with local inversions,
+  4. libigl SLIM with **symmetric Dirichlet** energy for iterative low-distortion optimization,
+  5. chart packing back to 0-1 UV space.
 
-1. Treats true/open mesh borders as already free (not proposed as seams).
-2. Detects continuous structural feature cycles from dihedral/topology flow.
-3. Detects planar cap / transition separator loops while rejecting individual smooth side quads.
-4. Splits the mesh into regions using those structural cuts.
-5. Adds controlled longitudinal openings between separated boundary loops for tube/strip-like regions.
-6. Adds a single controlled fallback slit for a large fully closed smooth region instead of many random cuts.
-7. Removes tiny dangling seam twigs.
+The input/output protocol is intentionally compatible with the previous MaxScript integration, so the workflow remains:
 
-The MaxScript workflow remains:
+`Generate -> Preview -> Apply -> Native Unfold`
 
-**Generate -> Preview -> Apply -> Unfold**
+## Why this is different from Native Unfold V1
+
+V1 contained a home-grown least-squares conformal approximation and fallback projection. V2 delegates the non-planar parameterization/optimization to established libigl implementations of LSCM and SLIM.
+
+SLIM is used after the initial parameterization to reduce distortion while favoring locally injective mappings. V2 never accepts a SLIM result with more flipped triangles than its initialization.
 
 ## Build
 
-Create a repository with this package, push it, then run **Build RotateUV Feature-Aware Auto Seam V2** under GitHub Actions. Download the artifact `RotateUV-Feature-Aware-Auto-Seam-V2-Windows`.
+Upload/replace the files in your existing GitHub repository and run the workflow:
 
-The artifact contains only:
+`Build RotateUV Native Unfold V2 + Standard Geometry V2.2`
+
+The artifact is:
+
+`RotateUV-Native-Unfold-V2-Windows`
+
+Expected artifact files:
+
 - `RotateUV_AutoSeam.exe`
-- `Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.ms`
-- `Rotate_UV_PRO_NATIVE_AUTO_SEAM_V1.mcr`
+- `RotateUV_Unfold.exe`
+- `Rotate_UV_PRO_NATIVE_UNFOLD_V2.ms`
+- `Rotate_UV_PRO_NATIVE_UNFOLD_V2.mcr`
+- `README_NATIVE_UNFOLD_V2.md`
+- `THIRD_PARTY_NOTICES.md`
 
-Keep the three files together.
+## First tests
+
+Do not test every model at once. Test these in order:
+
+1. capped cylinder -- regression; existing result should remain good,
+2. tube/torus -- must have enough seams to make the chart topologically disk-like before unfolding,
+3. chamfered box -- check that major faces/bevel bands remain coherent,
+4. sphere -- must have at least one valid opening seam; a completely closed sphere cannot be flattened injectively.
+
+For each object:
+
+`Generate -> Preview -> Apply -> Native Unfold`
+
+If the seam preview itself is wrong, Native Unfold cannot repair the topology; that remains a seam-planner issue. If the preview is right but UVs are poor, that is the V2 solver issue to tune.

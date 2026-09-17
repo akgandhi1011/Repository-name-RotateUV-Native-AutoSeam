@@ -17,6 +17,13 @@
 #include <utility>
 #include <vector>
 
+#include <Eigen/Core>
+#include <igl/boundary_loop.h>
+#include <igl/harmonic.h>
+#include <igl/lscm.h>
+#include <igl/map_vertices_to_circle.h>
+#include <igl/slim.h>
+
 struct Vec2 { double x=0.0, y=0.0; };
 struct Vec3 { double x=0.0, y=0.0, z=0.0; };
 static Vec3 operator+(const Vec3&a,const Vec3&b){ return {a.x+b.x,a.y+b.y,a.z+b.z}; }
@@ -45,7 +52,7 @@ struct EdgeHash {
 
 struct Face { std::vector<int> v; };
 struct InputMesh {
-    std::vector<Vec3> vertices; // geometry vertex index = vector index + 1
+    std::vector<Vec3> vertices;
     std::vector<Face> faces;
     std::set<EdgeKey> seams;
 };
@@ -160,6 +167,8 @@ struct Chart {
     std::vector<Vec2> uv;
     std::unordered_map<int,int> cutToLocal;
     int flips=0;
+    std::string method;
+    double energy=0.0;
 };
 
 static std::vector<Chart> buildCharts(const InputMesh&m,const CutMesh&c){
@@ -193,6 +202,16 @@ static Vec3 chartPos(const InputMesh&m,const CutMesh&c,const Chart&ch,int local)
     const int cv=ch.cutVerts[local]; const int gv=c.cutGeomVertex[cv]; return m.vertices[gv-1];
 }
 
+static int countFlips(const Eigen::MatrixXd&UV,const Eigen::MatrixXi&F){
+    int pos=0,neg=0;
+    for(int i=0;i<F.rows();++i){
+        const auto a=UV.row(F(i,0)); const auto b=UV.row(F(i,1)); const auto d=UV.row(F(i,2));
+        const double A=(b(0)-a(0))*(d(1)-a(1))-(b(1)-a(1))*(d(0)-a(0));
+        if(A>1e-12)++pos; else if(A<-1e-12)++neg;
+    }
+    return std::min(pos,neg);
+}
+
 static bool planarProject(const InputMesh&m,const CutMesh&c,Chart&ch){
     if(ch.tris.empty()||ch.cutVerts.size()<3)return false;
     Vec3 nsum{}; double areaSum=0.0;
@@ -206,92 +225,105 @@ static bool planarProject(const InputMesh&m,const CutMesh&c,Chart&ch){
         Vec3 a=chartPos(m,c,ch,t.a),b=chartPos(m,c,ch,t.b),d=chartPos(m,c,ch,t.c); Vec3 tn=norm(cross(b-a,d-a)); if(len2(tn)<1e-12)continue;
         const double ang=std::acos(clampd(std::abs(dot(tn,n)),-1.0,1.0))*57.29577951308232; worst=std::max(worst,ang);
     }
-    if(worst>3.0)return false;
-    // Stable basis: longest vector from centroid projected to plane.
+    if(worst>1.0)return false;
     Vec3 cen{}; for(int i=0;i<(int)ch.cutVerts.size();i++)cen=cen+chartPos(m,c,ch,i); cen=cen/(double)ch.cutVerts.size();
     Vec3 e1{}; double best=-1.0;
     for(int i=0;i<(int)ch.cutVerts.size();i++){Vec3 v=chartPos(m,c,ch,i)-cen;v=v-n*dot(v,n);double q=len2(v);if(q>best){best=q;e1=v;}}
     e1=norm(e1); if(len2(e1)<1e-12){e1=norm(cross(n,{0,0,1}));if(len2(e1)<1e-12)e1=norm(cross(n,{0,1,0}));}
     Vec3 e2=norm(cross(n,e1)); ch.uv.resize(ch.cutVerts.size());
     for(int i=0;i<(int)ch.cutVerts.size();i++){Vec3 d=chartPos(m,c,ch,i)-cen;ch.uv[i]={dot(d,e1),dot(d,e2)};}
+    ch.flips=0; ch.method="planar-isometric"; ch.energy=0.0; return true;
+}
+
+static bool buildEigenChart(const InputMesh&m,const CutMesh&c,const Chart&ch,Eigen::MatrixXd&V,Eigen::MatrixXi&F){
+    if(ch.cutVerts.size()<3 || ch.tris.empty()) return false;
+    V.resize((int)ch.cutVerts.size(),3);
+    for(int i=0;i<V.rows();++i){Vec3 p=chartPos(m,c,ch,i);V(i,0)=p.x;V(i,1)=p.y;V(i,2)=p.z;}
+    F.resize((int)ch.tris.size(),3);
+    for(int i=0;i<F.rows();++i){F(i,0)=ch.tris[i].a;F(i,1)=ch.tris[i].b;F(i,2)=ch.tris[i].c;}
     return true;
 }
 
-struct Row { std::vector<std::pair<int,double>> a; double rhs=0.0; };
-
-static bool pcgNormal(const std::vector<Row>&rows,int n,std::vector<double>&x){
-    if(n<=0){x.clear();return true;}
-    std::vector<double>b(n,0.0),diag(n,1e-12);
-    for(const auto&r:rows){for(const auto&ic:r.a){b[ic.first]+=ic.second*r.rhs;diag[ic.first]+=ic.second*ic.second;}}
-    auto apply=[&](const std::vector<double>&vin,std::vector<double>&out){
-        out.assign(n,0.0);
-        for(const auto&r:rows){double s=0.0;for(const auto&ic:r.a)s+=ic.second*vin[ic.first];for(const auto&ic:r.a)out[ic.first]+=ic.second*s;}
-        const double reg=1e-12;for(int i=0;i<n;i++)out[i]+=reg*vin[i];
-    };
-    x.assign(n,0.0); std::vector<double>r=b,z(n),p(n),Ap;
-    for(int i=0;i<n;i++)z[i]=r[i]/diag[i]; p=z;
-    double rz=0.0,bn=0.0; for(int i=0;i<n;i++){rz+=r[i]*z[i];bn+=b[i]*b[i];}
-    if(bn<1e-30)return true;
-    const double target=std::max(1e-18,bn*1e-20); const int maxIter=std::min(12000,std::max(800,n*8));
-    for(int it=0;it<maxIter;it++){
-        apply(p,Ap); double pAp=0.0;for(int i=0;i<n;i++)pAp+=p[i]*Ap[i]; if(std::abs(pAp)<1e-30)break;
-        double alpha=rz/pAp;for(int i=0;i<n;i++){x[i]+=alpha*p[i];r[i]-=alpha*Ap[i];}
-        double rn=0.0;for(double v:r)rn+=v*v;if(rn<=target)return true;
-        for(int i=0;i<n;i++)z[i]=r[i]/diag[i];double rz2=0.0;for(int i=0;i<n;i++)rz2+=r[i]*z[i];
-        if(std::abs(rz)<1e-30)break;double beta=rz2/rz;for(int i=0;i<n;i++)p[i]=z[i]+beta*p[i];rz=rz2;
-    }
-    // Accept a finite approximate solution; simple standard meshes converge well before this.
-    for(double v:x)if(!std::isfinite(v))return false;return true;
-}
-
-static int farthestEuclidean(const InputMesh&m,const CutMesh&c,const Chart&ch,int seed){
-    Vec3 p=chartPos(m,c,ch,seed);int best=seed;double bd=-1.0;
-    for(int i=0;i<(int)ch.cutVerts.size();i++){double d=len2(chartPos(m,c,ch,i)-p);if(d>bd){bd=d;best=i;}}return best;
-}
-
-static bool lscmSolve(const InputMesh&m,const CutMesh&c,Chart&ch){
-    const int n=(int)ch.cutVerts.size(); if(n<3||ch.tris.empty())return false;
-    int p0=farthestEuclidean(m,c,ch,0);int p1=farthestEuclidean(m,c,ch,p0);if(p0==p1)return false;
-    double pinDist=len(chartPos(m,c,ch,p1)-chartPos(m,c,ch,p0));if(pinDist<1e-8)pinDist=1.0;
-    std::vector<char>fixed(2*n,0);std::vector<double>fixedVal(2*n,0.0);
-    fixed[p0]=fixed[p0+n]=fixed[p1]=fixed[p1+n]=1; fixedVal[p1]=pinDist;
-    std::vector<int>freeIndex(2*n,-1);int freeN=0;for(int i=0;i<2*n;i++)if(!fixed[i])freeIndex[i]=freeN++;
-    std::vector<Row>rows;rows.reserve(ch.tris.size()*2);
-    for(const auto&t:ch.tris){
-        Vec3 P0=chartPos(m,c,ch,t.a),P1=chartPos(m,c,ch,t.b),P2=chartPos(m,c,ch,t.c);
-        const double l01=len(P1-P0),l02=len(P2-P0),l12=len(P2-P1);if(l01<1e-12)continue;
-        double x2=(l02*l02+l01*l01-l12*l12)/(2.0*l01);double y2sq=std::max(0.0,l02*l02-x2*x2);double y2=std::sqrt(y2sq);if(y2<1e-12)continue;
-        const double D=l01*y2; const double gx[3]={-y2/D,y2/D,0.0}; const double gy[3]={(x2-l01)/D,-x2/D,l01/D};
-        const int vi[3]={t.a,t.b,t.c};const double w=std::sqrt(std::max(1e-16,0.5*D));
-        Row r1,r2;
-        auto add=[&](Row&row,int full,double coeff){coeff*=w;if(fixed[full])row.rhs-=coeff*fixedVal[full];else row.a.push_back({freeIndex[full],coeff});};
-        for(int j=0;j<3;j++){
-            add(r1,vi[j],gx[j]); add(r1,vi[j]+n,-gy[j]);
-            add(r2,vi[j],gy[j]); add(r2,vi[j]+n,gx[j]);
+static bool lscmInit(const Eigen::MatrixXd&V,const Eigen::MatrixXi&F,Eigen::MatrixXd&UV){
+    Eigen::VectorXi bnd;
+    igl::boundary_loop(F,bnd);
+    if(bnd.size()>=2){
+        int ia=0,ib=1; double best=-1.0;
+        for(int i=0;i<bnd.size();++i){
+            for(int j=i+1;j<bnd.size();++j){
+                const double d=(V.row(bnd(i))-V.row(bnd(j))).squaredNorm();
+                if(d>best){best=d;ia=i;ib=j;}
+            }
         }
-        rows.push_back(std::move(r1));rows.push_back(std::move(r2));
+        Eigen::VectorXi b(2); b<<bnd(ia),bnd(ib);
+        double pd=std::sqrt(std::max(1e-12,best));
+        Eigen::MatrixXd bc(2,2); bc<<0.0,0.0,pd,0.0;
+        if(igl::lscm(V,F,b,bc,UV) && UV.rows()==V.rows() && UV.allFinite()) return true;
     }
-    if(rows.size()<2)return false;std::vector<double>x;if(!pcgNormal(rows,freeN,x))return false;
-    ch.uv.assign(n,{});
-    for(int i=0;i<n;i++){
-        auto val=[&](int full)->double{return fixed[full]?fixedVal[full]:x[freeIndex[full]];};
-        ch.uv[i]={val(i),val(i+n)};
-        if(!std::isfinite(ch.uv[i].x)||!std::isfinite(ch.uv[i].y))return false;
+    if(igl::lscm(V,F,UV) && UV.rows()==V.rows() && UV.allFinite()) return true;
+    return false;
+}
+
+static bool harmonicInit(const Eigen::MatrixXd&V,const Eigen::MatrixXi&F,Eigen::MatrixXd&UV){
+    Eigen::VectorXi bnd;
+    igl::boundary_loop(F,bnd);
+    if(bnd.size()<3) return false;
+    Eigen::MatrixXd bnd_uv;
+    igl::map_vertices_to_circle(V,bnd,bnd_uv);
+    igl::harmonic(V,F,bnd,bnd_uv,1,UV);
+    return UV.rows()==V.rows() && UV.cols()==2 && UV.allFinite();
+}
+
+static bool solveLibigl(const InputMesh&m,const CutMesh&c,Chart&ch,int slimIters){
+    Eigen::MatrixXd V,UV; Eigen::MatrixXi F;
+    if(!buildEigenChart(m,c,ch,V,F)) return false;
+
+    bool ok=lscmInit(V,F,UV);
+    int flips=ok?countFlips(UV,F):std::numeric_limits<int>::max();
+    if(!ok || flips>0){
+        Eigen::MatrixXd hUV;
+        if(harmonicInit(V,F,hUV)){
+            const int hf=countFlips(hUV,F);
+            if(!ok || hf<=flips){ UV=hUV; flips=hf; ok=true; ch.method="harmonic+SLIM"; }
+        }
     }
-    // Prefer a globally consistent orientation. This does not hide local flips; it only mirrors the whole chart if needed.
-    int pos=0,neg=0;for(const auto&t:ch.tris){Vec2 a=ch.uv[t.a],b=ch.uv[t.b],d=ch.uv[t.c];double A=(b.x-a.x)*(d.y-a.y)-(b.y-a.y)*(d.x-a.x);if(A>1e-12)pos++;else if(A<-1e-12)neg++;}
-    if(neg>pos)for(auto&uv:ch.uv)uv.y=-uv.y;
-    ch.flips=std::min(pos,neg);return true;
+    if(!ok) return false;
+    if(ch.method.empty()) ch.method="LSCM+SLIM";
+
+    Eigen::VectorXi b(0); Eigen::MatrixXd bc(0,2);
+    igl::SLIMData data;
+    try{
+        igl::slim_precompute(V,F,UV,data,igl::SYMMETRIC_DIRICHLET,b,bc,0.0);
+        Eigen::MatrixXd candidate=igl::slim_solve(data,std::max(1,slimIters));
+        if(candidate.rows()==UV.rows() && candidate.cols()==2 && candidate.allFinite()){
+            const int cf=countFlips(candidate,F);
+            // SLIM should be locally injective. Never accept a result with more flips than initialization.
+            if(cf<=flips){UV=candidate;flips=cf;ch.energy=data.energy;}
+        }
+    }catch(...){
+        // Keep proven LSCM/harmonic initialization if optimization fails unexpectedly.
+    }
+
+    // Normalize global orientation only; this does not hide local inversions.
+    int pos=0,neg=0;
+    for(int i=0;i<F.rows();++i){
+        auto a=UV.row(F(i,0));auto b0=UV.row(F(i,1));auto d=UV.row(F(i,2));
+        double A=(b0(0)-a(0))*(d(1)-a(1))-(b0(1)-a(1))*(d(0)-a(0)); if(A>1e-12)++pos;else if(A<-1e-12)++neg;
+    }
+    if(neg>pos) UV.col(1)=-UV.col(1);
+    ch.flips=std::min(pos,neg);
+    ch.uv.resize(UV.rows()); for(int i=0;i<UV.rows();++i) ch.uv[i]={UV(i,0),UV(i,1)};
+    return true;
 }
 
 static void fallbackProject(const InputMesh&m,const CutMesh&c,Chart&ch){
-    // PCA-lite fallback: choose the two longest bbox axes in world space.
     Vec3 mn{1e100,1e100,1e100},mx{-1e100,-1e100,-1e100};
     for(int i=0;i<(int)ch.cutVerts.size();i++){Vec3 p=chartPos(m,c,ch,i);mn.x=std::min(mn.x,p.x);mn.y=std::min(mn.y,p.y);mn.z=std::min(mn.z,p.z);mx.x=std::max(mx.x,p.x);mx.y=std::max(mx.y,p.y);mx.z=std::max(mx.z,p.z);}    
     std::array<std::pair<double,int>,3> axes={{{mx.x-mn.x,0},{mx.y-mn.y,1},{mx.z-mn.z,2}}};std::sort(axes.begin(),axes.end(),[](auto&a,auto&b){return a.first>b.first;});
     ch.uv.resize(ch.cutVerts.size());
     auto coord=[](const Vec3&p,int a){return a==0?p.x:(a==1?p.y:p.z);};
     for(int i=0;i<(int)ch.cutVerts.size();i++){Vec3 p=chartPos(m,c,ch,i);ch.uv[i]={coord(p,axes[0].second),coord(p,axes[1].second)};}
+    ch.method="fallback-projection";
 }
 
 static void packCharts(std::vector<Chart>&charts){
@@ -331,13 +363,20 @@ static bool writeOutput(const std::string&path,const InputMesh&m,const CutMesh&c
 
 int main(int argc,char**argv){
     if(argc<3){
-        std::cerr<<"RotateUV Native Unfold V1 - seam-constrained LSCM\nUsage: RotateUV_Unfold.exe input.ruvu output.ruvuv\n";return 2;
+        std::cerr<<"RotateUV Native Unfold V2 - libigl LSCM + SLIM\nUsage: RotateUV_Unfold.exe input.ruvu output.ruvuv [slimIterations]\n";return 2;
     }
+    int slimIters=20; if(argc>=4){try{slimIters=std::max(1,std::min(100,std::stoi(argv[3])));}catch(...){slimIters=20;}}
     InputMesh m;std::string err;if(!readInput(argv[1],m,err)){std::cerr<<err<<"\n";return 4;}
     CutMesh c=buildCutMesh(m);auto charts=buildCharts(m,c);if(charts.empty()){std::cerr<<"No UV charts could be created.\n";return 5;}
-    int fallbackCount=0,totalFlips=0;
-    for(auto&ch:charts){bool ok=planarProject(m,c,ch);if(!ok)ok=lscmSolve(m,c,ch);if(!ok){fallbackProject(m,c,ch);fallbackCount++;}totalFlips+=ch.flips;}
+    int fallbackCount=0,totalFlips=0,slimCharts=0,planarCharts=0;
+    for(auto&ch:charts){
+        bool ok=planarProject(m,c,ch); if(ok)++planarCharts;
+        if(!ok){ok=solveLibigl(m,c,ch,slimIters); if(ok)++slimCharts;}
+        if(!ok){fallbackProject(m,c,ch);fallbackCount++;}
+        totalFlips+=ch.flips;
+    }
     packCharts(charts);if(!writeOutput(argv[2],m,c,charts,err)){std::cerr<<err<<"\n";return 6;}
-    std::cout<<"RotateUV Native Unfold V1: charts="<<charts.size()<<" cutVerts="<<c.cutVertexCount<<" seams="<<m.seams.size()<<" fallbacks="<<fallbackCount<<" flips="<<totalFlips<<"\n";
+    std::cout<<"RotateUV Native Unfold V2: charts="<<charts.size()<<" cutVerts="<<c.cutVertexCount<<" seams="<<m.seams.size()
+             <<" slim="<<slimCharts<<" planar="<<planarCharts<<" fallbacks="<<fallbackCount<<" flips="<<totalFlips<<" iters="<<slimIters<<"\n";
     return 0;
 }
